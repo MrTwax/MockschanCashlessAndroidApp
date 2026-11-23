@@ -4,7 +4,7 @@ Für Buchungs- und Wiederherstellungstests ausschließlich leere, entbehrliche T
 
 ## Automatisierte Tests ausführen
 
-Android aus dem Projektverzeichnis mit JDK 17, Android SDK 35 und Gradle 8.5 bauen und testen. Die Ausgaben in `app/build/reports/tests/testDebugUnitTest/` zeigen die ausgeführten Tests.
+Android aus dem Projektverzeichnis mit JDK 17, Android SDK 36 und Gradle 8.13 bauen und testen. Die Ausgaben in `app/build/reports/tests/testDebugUnitTest/` zeigen die ausgeführten Tests.
 
 ```powershell
 gradle :app:assembleDebug :app:testDebugUnitTest
