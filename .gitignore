@@ -1,3 +1,10 @@
 # Project exclude paths
 /.gradle/
 /app/build/
+/local.properties
+/.env
+/.env.*
+!/.env.example
+/backend/.venv/
+__pycache__/
+.pytest_cache/

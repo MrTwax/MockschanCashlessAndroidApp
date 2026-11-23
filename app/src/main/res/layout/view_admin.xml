@@ -6,7 +6,7 @@
     android:layout_width="match_parent"
     android:layout_height="match_parent">
 
-    <Button
+    <com.google.android.material.button.MaterialButton
         android:id="@+id/btnBackAdmin"
         android:text="← Zurück"
         android:layout_width="wrap_content"
@@ -53,14 +53,14 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content">
 
-        <Button
+        <com.google.android.material.button.MaterialButton
             android:id="@+id/tabProducts"
             android:text="Produkte"
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_weight="1"/>
 
-        <Button
+        <com.google.android.material.button.MaterialButton
             android:id="@+id/tabUsers"
             android:text="Aktive Nutzer"
             android:layout_width="0dp"
@@ -68,12 +68,18 @@
             android:layout_weight="1"/>
 
         <!-- NEU: dritter Tab -->
-        <Button
+        <com.google.android.material.button.MaterialButton
             android:id="@+id/tabCounter"
             android:text="Zähler &amp; History"
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_weight="1"/>
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/tabSettings"
+            android:text="Einstellungen"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"/>
     </LinearLayout>
 
     <!-- Content container (you swap views inside) -->

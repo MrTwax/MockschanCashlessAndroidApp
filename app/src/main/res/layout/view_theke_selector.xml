@@ -1,50 +1,69 @@
 <?xml version="1.0" encoding="utf-8"?>
-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
     android:id="@+id/thekeSelectorRoot"
-    android:orientation="vertical"
-    android:padding="24dp"
-    android:gravity="center_horizontal"
     android:layout_width="match_parent"
-    android:layout_height="match_parent">
+    android:layout_height="match_parent"
+    android:fillViewport="true">
 
-    <Button
-        android:id="@+id/btnBackThekeSelector"
-        android:text="← Zurück"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content" />
-
-    <TextView
-        android:id="@+id/thekeSelectorTitle"
-        android:text="Theke auswählen"
-        android:textStyle="bold"
-        android:textSize="22sp"
-        android:layout_marginTop="12dp"
+    <LinearLayout
         android:layout_width="match_parent"
-        android:gravity="center"
-        android:layout_height="wrap_content" />
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="16dp">
 
-    <Button
-        android:id="@+id/btnDrinks"
-        android:text="Getränke"
-        android:textSize="20sp"
-        android:layout_marginTop="16dp"
-        android:layout_width="match_parent"
-        android:layout_height="60dp" />
+        <Button
+            android:id="@+id/btnBackThekeSelector"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:minHeight="48dp"
+            android:text="@string/operation_back" />
 
-    <Button
-        android:id="@+id/btnFood"
-        android:text="Essen"
-        android:textSize="20sp"
-        android:layout_marginTop="12dp"
-        android:layout_width="match_parent"
-        android:layout_height="60dp" />
+        <TextView
+            android:id="@+id/thekeSelectorTitle"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginVertical="12dp"
+            android:text="@string/operation_select_counter"
+            android:textSize="22sp"
+            android:textStyle="bold" />
 
-    <Button
-        android:id="@+id/btnWine"
-        android:text="Wein"
-        android:textSize="20sp"
-        android:layout_marginTop="12dp"
-        android:layout_width="match_parent"
-        android:layout_height="60dp" />
+        <Button
+            android:id="@+id/btnDrinks"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="8dp"
+            android:minHeight="64dp"
+            android:text="@string/operation_drinks"
+            android:textSize="18sp" />
 
-</LinearLayout>
+        <Button
+            android:id="@+id/btnFood"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="8dp"
+            android:minHeight="64dp"
+            android:text="@string/operation_food"
+            android:textSize="18sp" />
+
+        <Button
+            android:id="@+id/btnWine"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="8dp"
+            android:minHeight="64dp"
+            android:text="@string/operation_wine"
+            android:textSize="18sp"
+            android:visibility="gone" />
+
+        <Button
+            android:id="@+id/btnMobile"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="8dp"
+            android:minHeight="64dp"
+            android:text="@string/operation_mobile"
+            android:textSize="18sp"
+            android:visibility="gone" />
+
+    </LinearLayout>
+</ScrollView>

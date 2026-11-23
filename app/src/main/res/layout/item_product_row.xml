@@ -2,9 +2,10 @@
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:id="@+id/productRowRoot"
     android:orientation="horizontal"
-    android:padding="8dp"
-    android:layout_marginBottom="6dp"
-    android:background="#F7F7F7"
+    android:padding="12dp"
+    android:layout_marginTop="8dp"
+    android:gravity="center_vertical"
+    android:background="@drawable/odentaler_panel"
     android:layout_width="match_parent"
     android:layout_height="wrap_content">
 
@@ -40,28 +41,32 @@
         android:layout_width="wrap_content"
         android:layout_height="wrap_content">
 
-        <Button
+        <com.google.android.material.button.MaterialButton
             android:id="@+id/btnMinus"
-            android:text="-"
+            android:contentDescription="@string/operation_quantity_decrease"
+            android:text="−"
             android:textSize="20sp"
             android:layout_width="48dp"
-            android:layout_height="48dp" />
+            android:layout_height="wrap_content"
+            android:minHeight="48dp" />
 
         <TextView
             android:id="@+id/txtQty"
             android:text="0"
             android:textSize="20sp"
-            android:paddingLeft="12dp"
-            android:paddingRight="12dp"
+            android:gravity="center"
+            android:minWidth="36dp"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content" />
 
-        <Button
+        <com.google.android.material.button.MaterialButton
             android:id="@+id/btnPlus"
+            android:contentDescription="@string/operation_quantity_increase"
             android:text="+"
             android:textSize="20sp"
             android:layout_width="48dp"
-            android:layout_height="48dp" />
+            android:layout_height="wrap_content"
+            android:minHeight="48dp" />
     </LinearLayout>
 
 </LinearLayout>

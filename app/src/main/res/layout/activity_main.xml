@@ -2,27 +2,28 @@
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:id="@+id/root"
     android:orientation="vertical"
-    android:background="#FFFFFF"
+    android:fitsSystemWindows="true"
+    android:background="?attr/colorSurface"
     android:layout_width="match_parent"
     android:layout_height="match_parent">
 
-    <!-- Optional simple title bar -->
     <TextView
         android:id="@+id/titleBar"
-        android:text="Mockschan Cashless"
+        android:text="@string/app_name"
+        android:accessibilityHeading="true"
+        android:textColor="?attr/colorOnPrimary"
+        android:background="?attr/colorPrimary"
         android:textStyle="bold"
         android:textSize="22sp"
         android:gravity="center"
         android:padding="12dp"
-        android:background="#EEEEEE"
         android:layout_width="match_parent"
         android:layout_height="wrap_content" />
 
-    <!-- This is where you'll inflate the other views -->
     <FrameLayout
         android:id="@+id/mainContent"
         android:layout_width="match_parent"
         android:layout_height="0dp"
-        android:layout_weight="1"/>
+        android:layout_weight="1" />
 
 </LinearLayout>

@@ -2,1276 +2,1049 @@ package com.mockschan.cashless
 
 import android.app.Activity
 import android.app.AlertDialog
-import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
-import android.nfc.NfcAdapter
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.text.InputType
-import android.view.LayoutInflater
+import android.view.KeyEvent
 import android.view.View
-import android.widget.*
+import android.widget.Button
+import android.widget.EditText
+import android.widget.FrameLayout
+import android.widget.LinearLayout
+import android.widget.Switch
+import android.widget.TextView
+import android.widget.Toast
 import androidx.core.view.isVisible
-import okhttp3.*
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.RequestBody.Companion.toRequestBody
+import com.mockschan.cashless.scan.HidKeyboardScanner
+import com.mockschan.cashless.scan.ReaderModeScanner
+import com.mockschan.cashless.scan.ScanDebouncer
+import okhttp3.HttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import org.json.JSONArray
 import org.json.JSONObject
-import java.io.IOException
-import android.graphics.Color
-import java.util.Timer
-import java.util.TimerTask
+import java.math.BigDecimal
+import java.text.NumberFormat
+import java.util.Locale
+import java.util.UUID
 
 class MainActivity : Activity() {
-
-    // NFC & User
-    private var nfcAdapter: NfcAdapter? = null
-    private var currentUID: String? = null
-    private var currentBalance: Double = 0.0
-
-    private var lastUIDForTheke: String? = null
-    private var thekeResetAction: (() -> Unit)? = null
-    private var thekeRefreshTotals: (() -> Unit)? = null
-
-    // Trigger zum Neuaufbau der Produktliste (fix: Produkte erscheinen schon nach dem ersten Scan)
-    private var thekeBuildProducts: (() -> Unit)? = null
-
-    // Scan-Session (2 Minuten, vom Backend validiert; Client löscht lokal zur UX)
-    private var scanSessionId: String? = null
-    private var scanSessionTimer: Timer? = null
-    private val SESSION_TTL_MS = 120_000L
-
-    // Beleg der letzten Zahlung (bleibt sichtbar)
-    private var lastReceipt: JSONObject? = null
-
-    // UI
-    private lateinit var mainContent: FrameLayout
-
-    // HTTP
-    private val client = OkHttpClient()
-    private val apiBaseUrl = "https://cashless.local"
-
-    // Settings
-    private lateinit var prefs: SharedPreferences
-    private var wineEnabled = false
-
-    // PIN
-    private val PINKASSE = "2209"
-    private val PINADMIN = "1511"
-
-    // Daten
-    private data class Product(
-        val id: Int,
+    private data class EventConfig(
+        val id: String,
         val name: String,
-        val price: Double,
-        val inDrinks: Boolean,
-        val inFood: Boolean,
-        val inWine: Boolean
+        val areas: Set<String>,
+        val timeoutMillis: Long,
+        val presetCents: List<Long>
     )
-    private var productsCache: List<Product> = emptyList()
+
+    private data class AreaSession(val eventId: String, val area: String, val token: String)
+    private data class Scan(val id: String, val balanceCents: Long, val deadline: Long)
+    private data class Product(val id: Int, val name: String, val priceCents: Long, val category: String)
+
+    private data class RetainedSale(
+        val event: EventConfig,
+        val session: AreaSession,
+        val scan: Scan?,
+        val products: List<Product>,
+        val cart: Map<Int, Int>,
+        val catalogLoading: Boolean
+    )
+
+    private lateinit var settings: SharedPreferences
+    private lateinit var keyStore: DeviceKeyStore
+    private lateinit var bookings: BookingGuard
+    private lateinit var mainContent: FrameLayout
+    private lateinit var nfc: ReaderModeScanner
+    private lateinit var hid: HidKeyboardScanner
+
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val scanDebouncer = ScanDebouncer()
+    private var eventConfig: EventConfig? = null
+    private var areaSession: AreaSession? = null
+    private var scan: Scan? = null
+    private var scanLoading = false
+    private var products: List<Product> = emptyList()
+    private val cart = mutableMapOf<Int, Int>()
+    private var scanGeneration = 0L
+    private var screenGeneration = 0L
+    private var scanExpiry: Runnable? = null
+    private var messageExpiry: Runnable? = null
+    private var dialog: AlertDialog? = null
+    private var active = false
+    private var requestRunning = false
+    private var unusablePending = false
+    private var csvForExport: String? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
         mainContent = findViewById(R.id.mainContent)
+        settings = getSharedPreferences("settings", MODE_PRIVATE)
+        keyStore = DeviceKeyStore(settings)
+        settings.edit().remove("apiKey").apply()
+        val saved = settings.getString(PENDING_PREF, null)
+        val pending = saved?.let { runCatching { decodePending(JSONObject(it)) }.getOrNull() }
+        unusablePending = saved != null && pending == null
+        bookings = BookingGuard(object : BookingStore {
+            override fun read(): PendingBooking? = settings.getString(PENDING_PREF, null)?.let {
+                runCatching { decodePending(JSONObject(it)) }.getOrNull()
+            }
 
-        prefs = getSharedPreferences("settings", Context.MODE_PRIVATE)
-        wineEnabled = prefs.getBoolean("wineEnabled", false)
-
-        nfcAdapter = NfcAdapter.getDefaultAdapter(this)
-        if (nfcAdapter == null) {
-            Toast.makeText(this, "⚠️ NFC nicht verfügbar – manueller UID-Modus aktiv", Toast.LENGTH_LONG).show()
-        }
-
-        showHome()
+            override fun save(booking: PendingBooking?): Boolean {
+                val previous = settings.getString(PENDING_PREF, null)
+                val editor = settings.edit().putString(PENDING_PREF, booking?.let(::encodePending))
+                if (editor.commit()) return true
+                settings.edit().putString(PENDING_PREF, previous).apply()
+                return false
+            }
+        })
+        nfc = ReaderModeScanner(this, ::acceptScan)
+        hid = HidKeyboardScanner(::acceptScan)
+        @Suppress("DEPRECATION")
+        val retained = lastNonConfigurationInstance as? RetainedSale
+        if (retained == null) {
+            showHome()
+            if (savedInstanceState?.getBoolean(HAD_SCAN_STATE) == true && bookings.pending == null) {
+                notifyUser("Der Scan wurde durch einen Neustart beendet. Bitte das Armband erneut scannen.")
+            }
+        } else restoreSale(retained)
     }
 
-    override fun onBackPressed() {
-        val isTheke     = mainContent.findViewById<View?>(R.id.thekeRoot) != null
-        val isSelector  = mainContent.findViewById<View?>(R.id.thekeSelectorRoot) != null
+    @Deprecated("Android Activity configuration retention")
+    override fun onRetainNonConfigurationInstance(): Any? {
+        val event = eventConfig ?: return null
+        val session = areaSession?.takeIf { it.area != ADMIN } ?: return null
+        return RetainedSale(event, session, scan, products, cart.toMap(), scanLoading)
+    }
 
-        when {
-            isTheke -> {
-                thekeResetAction = null
-                thekeRefreshTotals = null
-                thekeBuildProducts = null
-                showThekeSelector()
-            }
-            isSelector -> showHome()
-            else -> super.onBackPressed()
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putBoolean(HAD_SCAN_STATE, scan != null || scanLoading)
+        super.onSaveInstanceState(outState)
+    }
+
+    private fun restoreSale(retained: RetainedSale) {
+        eventConfig = retained.event
+        areaSession = retained.session
+        if (retained.session.area == CASH) showCash() else showCounter(retained.session.area)
+        val band = retained.scan
+        val api = api()
+        if (bookings.pending != null || band == null || api == null) return
+        if (SystemClock.elapsedRealtime() >= band.deadline) {
+            showMessage("Die Scanzeit ist abgelaufen. Bitte das Armband erneut scannen.")
+            return
         }
+        scan = band
+        scheduleExpiry(retained.event.timeoutMillis)
+        products = retained.products
+        cart.putAll(retained.cart)
+        if (retained.catalogLoading && retained.session.area != CASH) {
+            loadProducts(api, retained.session, screenGeneration, scanGeneration)
+        } else renderSalesState()
     }
 
     override fun onResume() {
         super.onResume()
-        nfcAdapter?.enableReaderMode(
-            this,
-            { tag ->
-                val bytes = tag?.id ?: return@enableReaderMode
-                val uid = bytes.joinToString("") { "%02X".format(it) }
-                runOnUiThread {
-                    val inTheke = mainContent.findViewById<View?>(R.id.thekeRoot) != null
-
-                    // Wenn ein anderes Band gescannt wird, Theke zurücksetzen
-                    if (inTheke && thekeResetAction != null && lastUIDForTheke != null && lastUIDForTheke != uid) {
-                        thekeResetAction?.invoke()
-                    }
-
-                    currentUID = uid
-                    lastUIDForTheke = uid
-                    Toast.makeText(this, "Tag erkannt: $uid", Toast.LENGTH_SHORT).show()
-
-                    // Balance immer aktualisieren
-                    checkBalance(uid) { thekeRefreshTotals?.invoke() }
-
-                    // KASSE: Falls wir gerade im Kassenscreen sind → Buttons aktivieren & UID anzeigen
-                    val btnLoad = mainContent.findViewById<Button?>(R.id.btnLoadTokens)
-                    val btnRef  = mainContent.findViewById<Button?>(R.id.btnRefund)
-                    val uidInfo = mainContent.findViewById<TextView?>(R.id.uidInfo)
-                    if (btnLoad != null && btnRef != null) {
-                        btnLoad.isEnabled = true
-                        btnRef.isEnabled = true
-                        mainContent.findViewById<TextView?>(R.id.kasseScanHint)?.visibility = View.GONE
-                        uidInfo?.text = "Gescannt: $uid"
-                        updateStatusCards()
-                    }
-
-                    // THEKE: sofort eine POS-Session öffnen; nach dem Laden Liste bauen
-                    if (inTheke) {
-                        openSessionAfterScan(uid) {
-                            thekeBuildProducts?.invoke()  // UI jetzt aufbauen
-                        }
-                    }
-                }
-            },
-            NfcAdapter.FLAG_READER_NFC_A or NfcAdapter.FLAG_READER_SKIP_NDEF_CHECK,
-            null
-        )
+        active = true
+        startScanner()
+        renderSalesState()
+        if (!requestRunning) showPending()
     }
 
     override fun onPause() {
+        active = false
+        nfc.stop()
+        hid.stop()
         super.onPause()
-        nfcAdapter?.disableReaderMode(this)
     }
 
-    // ------------------------------------------------------------
-    // HOME
-    // ------------------------------------------------------------
-    private fun showHome() {
-        mainContent.removeAllViews()
-        val v = layoutInflater.inflate(R.layout.view_home, mainContent, false)
-        mainContent.addView(v)
-
-        val btnKasse = v.findViewById<Button>(R.id.btnKasse)
-        val btnTheke = v.findViewById<Button>(R.id.btnTheke)
-        val btnAdmin = v.findViewById<Button>(R.id.btnAdmin)
-        val btnManualUid = v.findViewById<Button>(R.id.btnManualUid)
-
-        updateStatusCards()
-
-        btnKasse.setOnClickListener { promptPin(PINKASSE) { showKasse() } }
-        btnTheke.setOnClickListener { showThekeSelector() }
-        btnAdmin.setOnClickListener { promptPin(PINADMIN) { showAdmin() } }
-
-        btnManualUid.setOnClickListener {
-            promptManualUID { uid ->
-                currentUID = uid
-                checkBalance(uid)
-            }
-        }
+    override fun onDestroy() {
+        dialog?.dismiss()
+        mainHandler.removeCallbacksAndMessages(null)
+        super.onDestroy()
     }
 
-    // ------------------------------------------------------------
-    // KASSE (scan-first)
-    // ------------------------------------------------------------
-    private fun showKasse() {
-        mainContent.removeAllViews()
-        val v = layoutInflater.inflate(R.layout.view_kasse, mainContent, false)
-        mainContent.addView(v)
-
-        v.findViewById<Button>(R.id.btnBackKasse).setOnClickListener { showHome() }
-
-        // Initialzustand: Buttons deaktivieren, solange kein Scan
-        val hasUid = currentUID != null
-        setKasseUiEnabled(v, hasUid)
-        if (!hasUid) showKasseScanHint(v) else v.findViewById<TextView?>(R.id.kasseScanHint)?.visibility = View.GONE
-        v.findViewById<TextView>(R.id.uidInfo).text = "Gescannt: ${currentUID ?: "-"}"
-        updateStatusCards()
-
-        // Aufladen
-        v.findViewById<Button>(R.id.btnLoadTokens).setOnClickListener {
-            if (currentUID == null) {
-                Toast.makeText(this, "Bitte erst Band scannen", Toast.LENGTH_SHORT).show()
-                return@setOnClickListener
-            }
-            showLoadDialogWithAfter {
-                // Nach Erfolg Kasse leeren und auf nächsten Scan warten
-                clearKasseState(v)
-                showKasseScanHint(v)
-            }
+    @Deprecated("Android Activity result callback")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != SAVE_CSV_REQUEST) return
+        val csv = csvForExport
+        csvForExport = null
+        val uri = data?.data
+        if (resultCode != RESULT_OK || uri == null) return
+        if (csv == null) {
+            notifyUser("Bitte den Export erneut in der Abrechnung starten.")
+            return
         }
-
-        // Auszahlen
-        v.findViewById<Button>(R.id.btnRefund).setOnClickListener {
-            if (currentUID == null) {
-                Toast.makeText(this, "Bitte erst Band scannen", Toast.LENGTH_SHORT).show()
-                return@setOnClickListener
+        val resolver = contentResolver
+        Thread {
+            val success = runCatching {
+                checkNotNull(resolver.openOutputStream(uri)).bufferedWriter(Charsets.UTF_8).use { it.write(csv) }
+            }.isSuccess
+            runOnUiThread {
+                if (!isDestroyed) notifyUser(if (success) "CSV gespeichert." else "CSV konnte nicht gespeichert werden.")
             }
-            AlertDialog.Builder(this)
-                .setTitle("Guthaben auszahlen")
-                .setMessage("Wirklich gesamtes Guthaben auszahlen?")
-                .setPositiveButton("Ja") { _, _ ->
-                    sendTransaction("refund", 0.0) {
-                        clearKasseState(v)
-                        showKasseScanHint(v)
-                    }
-                }
-                .setNegativeButton("Nein", null)
-                .show()
-        }
+        }.start()
     }
 
-    /** Kasse-UI aktivieren/deaktivieren (Buttons + Anzeige) */
-    private fun setKasseUiEnabled(root: View, enabled: Boolean) {
-        root.findViewById<Button>(R.id.btnLoadTokens)?.isEnabled = enabled
-        root.findViewById<Button>(R.id.btnRefund)?.isEnabled = enabled
-        val uidInfo = root.findViewById<TextView>(R.id.uidInfo)
-        if (!enabled) {
-            uidInfo?.text = "Gescannt: -"
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (!hasFocus && ::hid.isInitialized) hid.reset()
+    }
+
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (::hid.isInitialized && isHidEnabled() && hid.onKeyEvent(event, canScan())) return true
+        return super.dispatchKeyEvent(event)
+    }
+
+    @Deprecated("Android Activity back callback")
+    override fun onBackPressed() {
+        if (mainContent.findViewById<View?>(R.id.homeRoot) != null && !requestRunning) {
+            super.onBackPressed()
         } else {
-            uidInfo?.text = "Gescannt: ${currentUID ?: "-"}"
+            leaveScreen()
         }
     }
 
-    /** Nach Abschluss einer Kassen-Transaktion alles leeren & Buttons sperren */
-    private fun clearKasseState(root: View) {
-        currentUID = null
-        currentBalance = 0.0
-        setKasseUiEnabled(root, false)
-        updateStatusCards()
-    }
-
-    /** Hinweistext, wenn in der Kasse noch kein Band gescannt wurde (optional) */
-    private fun showKasseScanHint(root: View) {
-        root.findViewById<TextView?>(R.id.kasseScanHint)?.let { hint ->
-            hint.text = "Bitte Armband scannen, um aufzuladen oder auszuzahlen."
-            hint.visibility = View.VISIBLE
-        }
-    }
-
-    // Alter Auflade-Dialog: neue Variante mit Callback nach Erfolg
-    private fun showLoadDialogWithAfter(onAfterSuccess: () -> Unit) {
-        var amount = 0 // nur ganze Chips
-
-        val dialog = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(16), dp(16), dp(16), dp(16))
-        }
-
-        val display = TextView(this).apply {
-            text = amount.toString()
-            textSize = 24f
-            gravity = android.view.Gravity.CENTER
-        }
-
-        val row = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            val minus = Button(context).apply {
-                text = "–"
-                setOnClickListener {
-                    if (amount > 0) {
-                        amount -= 1
-                        display.text = amount.toString()
-                    }
-                }
-            }
-            val plus = Button(context).apply {
-                text = "+"
-                setOnClickListener {
-                    amount += 1
-                    display.text = amount.toString()
-                }
-            }
-            addView(minus)
-            addView(display, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-            addView(plus)
-        }
-
-        val quickGrid = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            val values = (5..50 step 5).toList()
-            for (chunk in values.chunked(3)) {
-                val r = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.HORIZONTAL }
-                chunk.forEach { v ->
-                    val b = Button(this@MainActivity).apply {
-                        text = "+$v"
-                        setOnClickListener {
-                            amount += v
-                            display.text = amount.toString()
-                        }
-                    }
-                    r.addView(b, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-                }
-                addView(r)
-            }
-        }
-
-        val manual = Button(this).apply {
-            text = "Betrag eingeben"
-            setOnClickListener {
-                val inp = EditText(this@MainActivity).apply {
-                    hint = "z. B. 12"
-                    inputType = InputType.TYPE_CLASS_NUMBER
-                }
-                AlertDialog.Builder(this@MainActivity)
-                    .setTitle("Chips manuell")
-                    .setView(inp)
-                    .setPositiveButton("OK") { _, _ ->
-                        val v = inp.text.toString().toIntOrNull()
-                        if (v != null && v >= 0) {
-                            amount = v
-                            display.text = amount.toString()
-                        } else {
-                            Toast.makeText(this@MainActivity, "Ungültige Eingabe", Toast.LENGTH_SHORT).show()
-                        }
-                    }
-                    .setNegativeButton("Abbrechen", null)
-                    .show()
-            }
-        }
-
-        dialog.addView(row)
-        dialog.addView(quickGrid)
-        dialog.addView(manual)
-
-        AlertDialog.Builder(this)
-            .setTitle("Chips aufladen")
-            .setView(dialog)
-            .setPositiveButton("Aufladen") { _, _ ->
-                if (currentUID == null) {
-                    Toast.makeText(this, "Bitte erst scannen", Toast.LENGTH_SHORT).show()
-                } else if (amount <= 0) {
-                    Toast.makeText(this, "Betrag wählen", Toast.LENGTH_SHORT).show()
-                } else {
-                    sendTransaction("load", amount.toDouble()) { onAfterSuccess() }
-                }
-            }
-            .setNegativeButton("Abbrechen", null)
-            .show()
-    }
-
-    // ------------------------------------------------------------
-    // THEKE
-    // ------------------------------------------------------------
-    private fun showThekeSelector() {
+    private fun installLayout(layout: Int): View {
+        screenGeneration++
+        clearScan()
+        clearMessage()
         mainContent.removeAllViews()
-        val v = layoutInflater.inflate(R.layout.view_theke_selector, mainContent, false)
-        mainContent.addView(v)
-
-        // nicht im Theken-Screen → alte Callbacks löschen
-        thekeResetAction = null
-        thekeRefreshTotals = null
-        thekeBuildProducts = null
-        // offene Scan-Session lokal beenden (UI-Logik), Server bleibt maßgeblich
-        clearLocalScanSession()
-
-        v.findViewById<Button>(R.id.btnBackThekeSelector).setOnClickListener { showHome() }
-
-        val btnDrinks = v.findViewById<Button>(R.id.btnDrinks)
-        val btnFood   = v.findViewById<Button>(R.id.btnFood)
-        val btnWine   = v.findViewById<Button>(R.id.btnWine)
-
-        btnWine.isVisible = wineEnabled
-
-        if (currentUID == null) {
-            Toast.makeText(this, "Bitte erst Armband scannen.", Toast.LENGTH_SHORT).show()
+        return layoutInflater.inflate(layout, mainContent, false).also {
+            mainContent.addView(it)
+            clearMessage()
         }
-
-        btnDrinks.setOnClickListener { showTheke("drinks") }
-        btnFood.setOnClickListener { showTheke("food") }
-        btnWine.setOnClickListener { showTheke("wine") }
     }
 
-    private fun showTheke(category: String) {
-        mainContent.removeAllViews()
-        val v = layoutInflater.inflate(R.layout.view_theke, mainContent, false)
-        mainContent.addView(v)
+    private fun showHome() {
+        areaSession = null
+        val view = installLayout(R.layout.view_home)
+        val cash = view.findViewById<Button>(R.id.btnKasse)
+        val drinks = view.findViewById<Button>(R.id.btnHomeDrinks)
+        val food = view.findViewById<Button>(R.id.btnHomeFood)
+        val wine = view.findViewById<Button>(R.id.btnHomeWine)
+        val mobile = view.findViewById<Button>(R.id.btnHomeMobile)
+        val admin = view.findViewById<Button>(R.id.btnAdmin)
+        val settingsButton = view.findViewById<Button>(R.id.btnManualUid)
+        val status = view.findViewById<TextView>(R.id.statusCard)
+        view.findViewById<Button>(R.id.btnTheke).isVisible = false
+        val buttons = mapOf(CASH to cash, "drinks" to drinks, "food" to food, "wine" to wine, "mobile" to mobile, ADMIN to admin)
 
-        val btnBack = v.findViewById<Button>(R.id.btnBackTheke)
-        btnBack.setOnClickListener {
-            thekeResetAction = null
-            thekeRefreshTotals = null
-            thekeBuildProducts = null
-            showThekeSelector()
+        for ((area, button) in buttons) {
+            button.isVisible = false
+            button.setOnClickListener { enterArea(area) }
         }
 
-        val tokenDisplay= v.findViewById<TextView>(R.id.tokenDisplay)
-        val tokenWarning= v.findViewById<TextView>(R.id.tokenWarning)
-        val orderNote   = v.findViewById<TextView>(R.id.orderNote)
-        val productList = v.findViewById<LinearLayout>(R.id.productList)
-        val btnPay      = v.findViewById<Button>(R.id.btnPay)
-        val btnCancel   = v.findViewById<Button>(R.id.btnCancel)
-
-        // Wenn (noch) keine Session existiert → Hinweis anzeigen
-        if (scanSessionId == null) {
-            showScanPrompt(productList)
-        }
-
-        // Auswahl pro Theken-Vorgang
-        val selection = mutableMapOf<Int, Int>()
-        val handler = Handler(Looper.getMainLooper())
-
-        fun calcTotal(): Double =
-            selection.entries.sumOf { (id, qty) ->
-                val price = productsCache.find { it.id == id }?.price ?: 0.0
-                price * qty
+        fun renderConfig() {
+            buttons.forEach { (area, button) -> button.isVisible = area in eventConfig?.areas.orEmpty() }
+            status.text = when {
+                unusablePending -> "Der gespeicherte Buchungsstatus ist unlesbar. Bitte die Administration hinzuziehen."
+                bookings.pending != null -> "Eine Buchung ist offen. Bitte den ursprünglichen Verkaufsbereich öffnen."
+                else -> eventConfig?.name.orEmpty()
             }
-
-        fun refreshTotals() {
-            val total = calcTotal()
-            val newBal = currentBalance - total
-            tokenDisplay.text = "Chips: %.2f → %.2f".format(currentBalance, newBal)
-            tokenWarning.isVisible = newBal < 0
-            tokenWarning.text = if (newBal < 0) "Nicht genug Chips!" else ""
         }
 
-        fun buildProductRows() {
-            productList.removeAllViews()
-            val filtered = when (category) {
-                "drinks" -> productsCache.filter { it.inDrinks }
-                "food"   -> productsCache.filter { it.inFood }
-                "wine"   -> productsCache.filter { it.inWine }
-                else     -> emptyList()
-            }
-
-            filtered.forEachIndexed { index, p ->
-                selection.putIfAbsent(p.id, 0)
-                val row = LayoutInflater.from(this).inflate(R.layout.item_product_row, productList, false)
-                val name = row.findViewById<TextView>(R.id.txtProductName)
-                val price = row.findViewById<TextView>(R.id.txtProductPrice)
-                val qty = row.findViewById<TextView>(R.id.txtQty)
-                val btnMinus = row.findViewById<Button>(R.id.btnMinus)
-                val btnPlus = row.findViewById<Button>(R.id.btnPlus)
-
-                name.text = p.name
-                price.text = "Preis: %.2f Chips".format(p.price)
-                qty.text = (selection[p.id] ?: 0).toString()
-
-                fun applyRowColor() {
-                    val q = selection[p.id] ?: 0
-                    val base = if (index % 2 == 0) "#F7F7F7" else "#FFFFFF" // Zebra
-                    val highlight = "#E8F5E9" // zartes Grün bei Auswahl
-                    row.setBackgroundColor(Color.parseColor(if (q > 0) highlight else base))
-                }
-                applyRowColor()
-
-                btnPlus.setOnClickListener {
-                    selection[p.id] = (selection[p.id] ?: 0) + 1
-                    qty.text = selection[p.id].toString()
-                    applyRowColor()
-                    refreshTotals()
-                }
-                btnMinus.setOnClickListener {
-                    val cur = selection[p.id] ?: 0
-                    if (cur > 0) {
-                        selection[p.id] = cur - 1
-                        qty.text = selection[p.id].toString()
-                        applyRowColor()
-                        refreshTotals()
-                    }
-                }
-
-                productList.addView(row)
-            }
-            refreshTotals()
+        eventConfig = null
+        renderConfig()
+        settingsButton.text = "Geräteverbindung einrichten"
+        settingsButton.isVisible = bookings.pending == null && !unusablePending
+        settingsButton.setOnClickListener { showConnectionSettings() }
+        val api = api()
+        if (api == null) {
+            if (bookings.pending == null && !unusablePending) status.text = "Bitte zuerst die Geräteverbindung einrichten."
+            return
         }
 
-        // Callback setzen: späterer Neuaufbau nach erstem Scan
-        thekeBuildProducts = { buildProductRows() }
-
-        // Reset-Action: bei neuem Scan Auswahl leeren + Anzeige neu zeichnen
-        thekeResetAction = {
-            selection.clear()
-            buildProductRows()
-            orderNote.isVisible = false
-            orderNote.setBackgroundColor(Color.TRANSPARENT)
-            orderNote.setTextColor(Color.BLACK)
-            tokenWarning.isVisible = false
-            refreshTotals()
-        }
-        lastUIDForTheke = currentUID
-
-        // Wird aufgerufen, wenn checkBalance nach Scan fertig ist
-        thekeRefreshTotals = { refreshTotals() }
-
-        // Pay mit Session (verbraucht die Session serverseitig)
-        btnPay.setOnClickListener {
-            val total = calcTotal()
-            when {
-                total <= 0 -> Toast.makeText(this, "Keine Auswahl", Toast.LENGTH_SHORT).show()
-                total > currentBalance -> Toast.makeText(this, "Nicht genug Chips", Toast.LENGTH_SHORT).show()
-                scanSessionId == null -> Toast.makeText(this, "Bitte zuerst Band scannen", Toast.LENGTH_SHORT).show()
-                else -> {
-                    val items = JSONArray().apply {
-                        selection.filter { it.value > 0 }.forEach { (id, qty) ->
-                            val prod = productsCache.find { it.id == id }
-                            if (prod != null) {
-                                put(JSONObject().apply {
-                                    put("id", prod.id)
-                                    put("name", prod.name)
-                                    put("qty", qty)
-                                    put("price", prod.price)
-                                })
-                            }
-                        }
-                    }
-                    postChargeWithSession(total, items) { ok, receipt ->
-                        if (ok) {
-                            lastReceipt = receipt // Beleg bleibt sichtbar (eigenes Panel möglich)
-
-                            // Grüne Bestätigung inline
-                            val note = selection
-                                .filter { it.value > 0 }
-                                .entries
-                                .joinToString("\n") { (id, qty) ->
-                                    val prodName = productsCache.find { it.id == id }?.name ?: "Unbekannt"
-                                    "$prodName × $qty"
-                                }
-                            orderNote.apply {
-                                isVisible = true
-                                text = "✓ Bezahlt\n$note"
-                                setBackgroundColor(Color.parseColor("#43A047"))
-                                setTextColor(Color.WHITE)
-                            }
-                            Handler(Looper.getMainLooper()).postDelayed({
-                                orderNote.isVisible = false
-                                orderNote.setBackgroundColor(Color.TRANSPARENT)
-                                orderNote.setTextColor(Color.BLACK)
-                            }, 2 * 60 * 1000L)
-
-                            // Session lokal leeren & Produkte ausblenden
-                            clearLocalScanSession()
-                            selection.clear()
-                            showScanPrompt(productList)
-
-                            // Balance neu laden (nur Anzeige)
-                            currentUID?.let { uid -> checkBalance(uid) { thekeRefreshTotals?.invoke() } }
-                        }
-                    }
+        status.text = "Veranstaltung wird geladen …"
+        val screen = screenGeneration
+        api.request("bootstrap") { reply ->
+            onScreen(screen) {
+                eventConfig = if (reply.successful) decodeEvent(reply.objectBody()) else null
+                if (eventConfig == null) status.text = "Verbindung zur Kasse unterbrochen – bitte kurz prüfen."
+                else {
+                    renderConfig()
+                    settingsButton.isVisible = false
                 }
             }
         }
-
-        // Cancel: Session invalidieren, Auswahl leeren, Produkte ausblenden bis neuer Scan
-        btnCancel.setOnClickListener {
-            posCancel {
-                selection.clear()
-                showScanPrompt(productList)
-                orderNote.isVisible = false
-                orderNote.setBackgroundColor(Color.TRANSPARENT)
-                orderNote.setTextColor(Color.BLACK)
-                refreshTotals()
-            }
-        }
-
-        // Produkte laden (nur wenn Session existiert, sonst Hinweis)
-        loadThekeProducts {
-            if (scanSessionId == null) {
-                showScanPrompt(productList)
-            } else {
-                buildProductRows()
-            }
-        }
-
-        refreshTotals()
     }
 
-    // ------------------------------------------------------------
-    // ADMIN
-    // ------------------------------------------------------------
-    private fun showAdmin() {
-        mainContent.removeAllViews()
-        val v = layoutInflater.inflate(R.layout.view_admin, mainContent, false)
-        mainContent.addView(v)
-
-        v.findViewById<Button>(R.id.btnBackAdmin).setOnClickListener { showHome() }
-        val adminContent = v.findViewById<FrameLayout>(R.id.adminContent)
-
-        val switchWine = v.findViewById<Switch>(R.id.switchWine)
-        switchWine.isChecked = wineEnabled
-        switchWine.setOnCheckedChangeListener { _, isChecked ->
-            wineEnabled = isChecked
-            prefs.edit().putBoolean("wineEnabled", isChecked).apply()
-            Toast.makeText(this, if (isChecked) "Wein aktiviert" else "Wein deaktiviert", Toast.LENGTH_SHORT).show()
+    private fun enterArea(area: String) {
+        val config = eventConfig ?: return
+        if (requestRunning || area !in config.areas) return
+        if (unusablePending && area != ADMIN) {
+            notifyUser("Der gespeicherte Buchungsstatus muss geprüft werden.")
+            return
         }
-
-        val tabProducts = v.findViewById<Button>(R.id.tabProducts)
-        val tabUsers    = v.findViewById<Button>(R.id.tabUsers)
-        val tabCounter  = v.findViewById<Button>(R.id.tabCounter) // NEU
-
-        tabProducts.setOnClickListener { renderAdminProducts(adminContent) }
-        tabUsers.setOnClickListener    { renderAdminUsers(adminContent) }
-        tabCounter.setOnClickListener  { renderAdminCounter(adminContent) } // NEU
-
-        renderAdminProducts(adminContent) // default
-    }
-
-    // --- NEU: Counter/History-Tab rendern ---
-    private fun renderAdminCounter(container: FrameLayout) {
-        container.removeAllViews()
-        val view = layoutInflater.inflate(R.layout.view_admin_counter, container, false)
-        container.addView(view)
-
-        val txtSummary = view.findViewById<TextView>(R.id.txtSummary)
-        val btnRefresh = view.findViewById<Button>(R.id.btnSummaryRefresh)
-        val btnReset   = view.findViewById<Button>(R.id.btnReset)
-        val listHistory= view.findViewById<LinearLayout>(R.id.listHistory)
-
-        fun refreshAll() {
-            loadSummary { since, topup, ret, net ->
-                runOnUiThread {
-                    txtSummary.text = "Seit: $since\nAufgeladen: ${fmt(topup)}\nZurückgegeben: ${fmt(ret)}\nNetto: ${fmt(net)}"
-                }
-            }
-            loadHistory { arr ->
-                runOnUiThread {
-                    listHistory.removeAllViews()
-                    if (arr.length() == 0) {
-                        listHistory.addView(TextView(this).apply { text = "Noch keine Snapshots." })
-                    } else {
-                        for (i in 0 until arr.length()) {
-                            val o = arr.getJSONObject(i)
-                            listHistory.addView(TextView(this).apply {
-                                text = "• ${o.getString("name")} | ${o.optString("range_start")} → ${o.optString("range_end")} | " +
-                                        "Auf: ${fmt(o.optDouble("topup_total",0.0))} | Zur: ${fmt(o.optDouble("return_total",0.0))} | Netto: ${fmt(o.optDouble("net_total",0.0))}"
-                                setPadding(dp(0), dp(6), dp(0), dp(6))
-                            })
-                        }
-                    }
-                }
-            }
+        val pending = bookings.pending
+        if (pending != null && (pending.eventId != config.id || pending.area != area) && area != ADMIN) {
+            notifyUser("Bitte zuerst die offene Buchung im ursprünglichen Bereich prüfen.")
+            return
         }
-
-        btnRefresh.setOnClickListener { refreshAll() }
-        btnReset.setOnClickListener {
-            val input = EditText(this).apply { hint = "Event-Name (Pflicht)" }
-            AlertDialog.Builder(this)
-                .setTitle("Snapshot anlegen & Zähler zurücksetzen")
-                .setView(input)
-                .setPositiveButton("Speichern") { _, _ ->
-                    val name = input.text.toString().trim()
-                    if (name.isEmpty()) {
-                        Toast.makeText(this, "Bitte Namen eingeben", Toast.LENGTH_SHORT).show()
-                    } else {
-                        postReset(name) { ok ->
-                            runOnUiThread {
-                                if (ok) {
-                                    Toast.makeText(this, "Snapshot gespeichert", Toast.LENGTH_SHORT).show()
-                                    refreshAll()
-                                } else {
-                                    Toast.makeText(this, "Reset fehlgeschlagen", Toast.LENGTH_SHORT).show()
-                                }
-                            }
-                        }
-                    }
-                }
+        if (area == CASH || area == ADMIN) {
+            val pin = EditText(this).apply {
+                inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_VARIATION_PASSWORD
+                setSingleLine()
+            }
+            trackDialog(AlertDialog.Builder(this)
+                .setTitle(if (area == CASH) "Kassen-PIN" else "Admin-PIN")
+                .setView(pin)
                 .setNegativeButton("Abbrechen", null)
-                .show()
+                .setPositiveButton("Öffnen") { _, _ -> openSession(config, area, pin.text.toString()) }
+                .create())
+        } else openSession(config, area)
+    }
+
+    private fun openSession(config: EventConfig, area: String, pin: String? = null) {
+        val api = api() ?: return
+        val screen = screenGeneration
+        val payload = JSONObject().put("area", area).apply { if (pin != null) put("pin", pin) }
+        requestRunning = true
+        api.request("session", "POST", payload.toString()) { reply ->
+            onScreen(screen) {
+                requestRunning = false
+                val token = reply.objectBody()?.optString("token")?.takeIf(String::isNotBlank)
+                if (!reply.successful || token == null) {
+                    notifyUser(when (reply.error) {
+                        "invalid_pin" -> "Die PIN stimmt nicht."
+                        "pin_locked" -> "Zu viele Versuche. Bitte kurz warten."
+                        "area_unavailable" -> "Dieser Bereich ist gesperrt."
+                        else -> "Verbindung zur Kasse unterbrochen – bitte kurz prüfen."
+                    })
+                    return@onScreen
+                }
+                areaSession = AreaSession(config.id, area, token)
+                when (area) {
+                    CASH -> showCash()
+                    ADMIN -> showConnectionSettings(admin = true)
+                    else -> showCounter(area)
+                }
+                if (bookings.pending?.area == area) showPending()
+            }
         }
-
-        // Initial laden
-        refreshAll()
     }
 
-    // --- /admin/summary ---
-    private fun loadSummary(onDone: (since: String, topup: Double, ret: Double, net: Double) -> Unit) {
-        val req = Request.Builder().url("$apiBaseUrl/admin/summary").get().build()
-        client.newCall(req).enqueue(object: Callback{
-            override fun onFailure(call: Call, e: IOException) { onDone("-", 0.0, 0.0, 0.0) }
-            override fun onResponse(call: Call, resp: Response) {
-                resp.use {
-                    val j = JSONObject(it.body?.string() ?: "{}")
-                    onDone(
-                        j.optString("since", "-"),
-                        j.optDouble("topup_total", 0.0),
-                        j.optDouble("return_total", 0.0),
-                        j.optDouble("net_total", 0.0)
-                    )
-                }
-            }
-        })
-    }
-
-    // --- /admin/history ---
-    private fun loadHistory(onDone: (JSONArray) -> Unit) {
-        val req = Request.Builder().url("$apiBaseUrl/admin/history?limit=100").get().build()
-        client.newCall(req).enqueue(object: Callback{
-            override fun onFailure(call: Call, e: IOException) { onDone(JSONArray()) }
-            override fun onResponse(call: Call, resp: Response) {
-                resp.use {
-                    val arr = JSONArray(it.body?.string() ?: "[]")
-                    onDone(arr)
-                }
-            }
-        })
-    }
-
-    // --- /admin/reset ---
-    private fun postReset(name: String, onDone: (Boolean) -> Unit) {
-        val body = JSONObject(mapOf("name" to name)).toString()
-            .toRequestBody("application/json".toMediaType())
-        val req = Request.Builder().url("$apiBaseUrl/admin/reset").post(body).build()
-        client.newCall(req).enqueue(object: Callback{
-            override fun onFailure(call: Call, e: IOException) { onDone(false) }
-            override fun onResponse(call: Call, resp: Response) { onDone(resp.isSuccessful) }
-        })
-    }
-
-    // --- kleine Format-Hilfe ---
-    private fun fmt(v: Double) = String.format("%.2f", v)
-
-    private fun renderAdminProducts(container: FrameLayout) {
-        container.removeAllViews()
-        val view = layoutInflater.inflate(R.layout.view_admin_products, container, false)
+    private fun showConnectionSettings(admin: Boolean = false) {
+        val page = installLayout(R.layout.view_admin)
+        page.findViewById<TextView>(R.id.adminTitle).text = if (admin) "Administration" else "Geräteverbindung"
+        page.findViewById<View>(R.id.wineSwitchRow).isVisible = admin
+        page.findViewById<View>(R.id.adminTabs).isVisible = false
+        if (admin) renderAdminAreas(page)
+        page.findViewById<Button>(R.id.btnBackAdmin).setOnClickListener { showHome() }
+        val container = page.findViewById<FrameLayout>(R.id.adminContent)
+        val view = layoutInflater.inflate(R.layout.view_admin_settings, container, false)
         container.addView(view)
-
-        val btnNew = view.findViewById<Button>(R.id.btnNewProduct)
-        val listLayout = view.findViewById<LinearLayout>(R.id.adminProductList)
-
-        btnNew.setOnClickListener { promptNewProduct { renderAdminProducts(container) } }
-
-        listLayout.removeAllViews()
-        val loading = TextView(this).apply { text = "Lade Produkte..." }
-        listLayout.addView(loading)
-
-        client.newCall(Request.Builder().url("$apiBaseUrl/products").get().build())
-            .enqueue(object : Callback {
-                override fun onFailure(call: Call, e: IOException) = runOnUiThread {
-                    Toast.makeText(this@MainActivity, "Fehler beim Laden", Toast.LENGTH_SHORT).show()
-                }
-                override fun onResponse(call: Call, response: Response) {
-                    val arr = JSONArray(response.body?.string() ?: "[]")
-                    runOnUiThread {
-                        listLayout.removeAllViews()
-                        for (i in 0 until arr.length()) {
-                            val o = arr.getJSONObject(i)
-                            val id = o.getInt("id")
-                            val n  = o.getString("name")
-                            val p  = o.getDouble("price")
-                            val dr = o.getBoolean("in_drinks")
-                            val fd = o.getBoolean("in_food")
-                            val wn = o.getBoolean("in_wine")
-
-                            val row = LinearLayout(this@MainActivity).apply {
-                                orientation = LinearLayout.HORIZONTAL
-                                setPadding(dp(6), dp(6), dp(6), dp(6))
-                            }
-                            val info = TextView(this@MainActivity).apply {
-                                text = "$n – %.2f Chips\nDr:$dr  Es:$fd  Wn:$wn".format(p)
-                                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-                            }
-                            val edit = Button(this@MainActivity).apply {
-                                text = "✏️"
-                                setOnClickListener {
-                                    promptEditProduct(id, n, p, dr, fd, wn) {
-                                        renderAdminProducts(container)
-                                    }
-                                }
-                            }
-                            val del = Button(this@MainActivity).apply {
-                                text = "🗑"
-                                setOnClickListener {
-                                    client.newCall(
-                                        Request.Builder().url("$apiBaseUrl/products/$id").delete().build()
-                                    ).enqueue(object : Callback {
-                                        override fun onFailure(c: Call, e: IOException) = runOnUiThread {
-                                            Toast.makeText(this@MainActivity, "Fehler", Toast.LENGTH_SHORT).show()
-                                        }
-                                        override fun onResponse(c: Call, r: Response) = runOnUiThread {
-                                            renderAdminProducts(container)
-                                        }
-                                    })
-                                }
-                            }
-                            row.addView(info)
-                            row.addView(edit)
-                            row.addView(del)
-                            listLayout.addView(row)
-                        }
-                    }
-                }
-            })
-    }
-
-    private fun renderAdminUsers(container: FrameLayout) {
-        container.removeAllViews()
-        val view = layoutInflater.inflate(R.layout.view_admin_users, container, false)
-        container.addView(view)
-
-        val list = view.findViewById<LinearLayout>(R.id.adminUsersList)
-        val btnDeleteAll = view.findViewById<Button>(R.id.btnDeleteAllUsers)
-
-        // "Alle Nutzer löschen" jetzt hier
-        btnDeleteAll.setOnClickListener {
-            AlertDialog.Builder(this)
-                .setTitle("Achtung!")
-                .setMessage("Alle Benutzer löschen?")
-                .setPositiveButton("Ja") { _, _ ->
-                    client.newCall(Request.Builder().url("$apiBaseUrl/reset").delete().build())
-                        .enqueue(object : Callback {
-                            override fun onFailure(call: Call, e: IOException) = runOnUiThread {
-                                Toast.makeText(this@MainActivity, "Fehler", Toast.LENGTH_SHORT).show()
-                            }
-                            override fun onResponse(call: Call, response: Response) = runOnUiThread {
-                                Toast.makeText(this@MainActivity, "Nutzer gelöscht", Toast.LENGTH_SHORT).show()
-                                renderAdminUsers(container)
-                            }
-                        })
-                }
-                .setNegativeButton("Nein", null)
-                .show()
-        }
-
-        list.removeAllViews()
-        client.newCall(Request.Builder().url("$apiBaseUrl/users?nonzero=1").get().build())
-            .enqueue(object : Callback {
-                override fun onFailure(call: Call, e: IOException) = runOnUiThread {
-                    Toast.makeText(this@MainActivity, "Fehler beim Laden", Toast.LENGTH_SHORT).show()
-                }
-                override fun onResponse(call: Call, response: Response) {
-                    val arr = JSONArray(response.body?.string() ?: "[]")
-                    runOnUiThread {
-                        list.removeAllViews()
-                        if (arr.length() == 0) {
-                            list.addView(TextView(this@MainActivity).apply { text = "Keine Nutzer" })
-                            return@runOnUiThread
-                        }
-                        for (i in 0 until arr.length()) {
-                            val o = arr.getJSONObject(i)
-                            val row = layoutInflater.inflate(R.layout.item_user_row, list, false)
-                            val lbl = row.findViewById<TextView>(R.id.txtUserInfo)
-                            lbl.text = "${o.getString("uid")} → ${"%.2f".format(o.getDouble("balance"))} Chips"
-                            list.addView(row)
-                        }
-                    }
-                }
-            })
-    }
-
-    // ------------------------------------------------------------
-    // DIALOGE / HILFSFUNKTIONEN
-    // ------------------------------------------------------------
-    private fun promptPin(correctPin: String, onSuccess: () -> Unit) {
-        val pinInput = EditText(this).apply {
-            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_VARIATION_PASSWORD
-        }
-        AlertDialog.Builder(this)
-            .setTitle("PIN eingeben")
-            .setView(pinInput)
-            .setPositiveButton("OK") { _, _ ->
-                if (pinInput.text.toString() == correctPin) onSuccess()
-                else Toast.makeText(this, "Falsche PIN", Toast.LENGTH_SHORT).show()
-            }
-            .setNegativeButton("Abbrechen", null)
-            .show()
-    }
-
-    private fun promptManualUID(onSet: (String) -> Unit) {
-        val inp = EditText(this).apply {
-            hint = "UID (Hex, z.B. 04A1...)"
-            inputType = InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD
-        }
-        AlertDialog.Builder(this)
-            .setTitle("UID manuell eingeben")
-            .setView(inp)
-            .setPositiveButton("OK") { _, _ ->
-                val uid = inp.text.toString().trim().uppercase()
-                if (uid.isNotBlank()) onSet(uid) else Toast.makeText(this, "Ungültig", Toast.LENGTH_SHORT).show()
-            }
-            .setNegativeButton("Abbrechen", null)
-            .show()
-    }
-
-    private fun dp(v: Int): Int = (v * resources.displayMetrics.density + 0.5f).toInt()
-
-    // ------------------------------------------------------------
-    // NETZWERK / POS-SESSION
-    // ------------------------------------------------------------
-
-    /** Kleiner Hinweis-Block statt Produktliste, bis ein Band gescannt wurde. */
-    private fun showScanPrompt(container: LinearLayout) {
-        container.removeAllViews()
-        val hint = TextView(this).apply {
-            text = "Bitte Armband scannen – dann werden die Produkte angezeigt."
-            textSize = 16f
-            setPadding(dp(12), dp(12), dp(12), dp(12))
-        }
-        container.addView(hint)
-    }
-
-    /**
-     * Öffnet nach NFC-Scan eine POS-Session (2 Minuten) und speichert scanSessionId.
-     * Produkte werden erst dann angezeigt.
-     */
-    private fun openSessionAfterScan(uid: String, onReady: (() -> Unit)? = null) {
-        val payload = JSONObject().apply {
-            put("uid", uid)
-            put("pos_id", "POS-ANDROID-1")
-        }.toString().toRequestBody("application/json".toMediaType())
-
-        val req = Request.Builder()
-            .url("$apiBaseUrl/pos/scan")
-            .post(payload)
-            .build()
-
-        client.newCall(req).enqueue(object: Callback {
-            override fun onFailure(call: Call, e: IOException) = runOnUiThread {
-                Toast.makeText(this@MainActivity, "Scan fehlgeschlagen", Toast.LENGTH_SHORT).show()
-            }
-            override fun onResponse(call: Call, resp: Response) {
-                val text = resp.body?.string() ?: "{}"
-                val json = JSONObject(text)
-                if (!resp.isSuccessful) {
-                    runOnUiThread { Toast.makeText(this@MainActivity, json.optString("error","Scan fehlgeschlagen"), Toast.LENGTH_SHORT).show() }
-                    return
-                }
-                scanSessionId = json.optString("scanSessionId", null)
-                // lokaler TTL-Timer (zusätzlich zur Server-Validierung) – nur fürs UI
-                resetLocalSessionTimer()
-                // Direkt Produkte für Theke laden, danach onReady triggern
-                runOnUiThread {
-                    loadThekeProducts { onReady?.invoke() }
-                }
-            }
-        })
-    }
-
-    private fun resetLocalSessionTimer() {
-        scanSessionTimer?.cancel()
-        scanSessionTimer = Timer().apply {
-            schedule(object: TimerTask() {
-                override fun run() {
-                    runOnUiThread {
-                        clearLocalScanSession()
-                        // Produkte verschwinden automatisch, weil loadThekeProducts nur mit Session lädt
-                    }
-                }
-            }, SESSION_TTL_MS)
-        }
-    }
-
-    private fun clearLocalScanSession() {
-        scanSessionTimer?.cancel()
-        scanSessionTimer = null
-        scanSessionId = null
-    }
-
-    /** Produkte für die Theke nur laden, wenn eine gültige Session existiert. */
-    private fun loadThekeProducts(onDone: () -> Unit) {
-        val sid = scanSessionId
-        if (sid == null) {
-            onDone()
-            return
-        }
-        val req = Request.Builder()
-            .url("$apiBaseUrl/pos/products")
-            .get()
-            .addHeader("X-Scan-Session", sid)
-            .build()
-
-        client.newCall(req).enqueue(object: Callback {
-            override fun onFailure(call: Call, e: IOException) = runOnUiThread {
-                Toast.makeText(this@MainActivity, "Produkte laden fehlgeschlagen", Toast.LENGTH_SHORT).show()
-                onDone()
-            }
-            override fun onResponse(call: Call, resp: Response) {
-                val text = resp.body?.string() ?: "{}"
-                if (!resp.isSuccessful) {
-                    runOnUiThread {
-                        Toast.makeText(this@MainActivity, "Bitte Band scannen", Toast.LENGTH_SHORT).show()
-                        clearLocalScanSession()
-                        onDone()
-                    }
-                    return
-                }
-                val arr = JSONObject(text).optJSONArray("products") ?: JSONArray()
-                productsCache = (0 until arr.length()).map { i ->
-                    val o = arr.getJSONObject(i)
-                    Product(
-                        o.getInt("id"),
-                        o.getString("name"),
-                        o.getDouble("price"),
-                        o.getBoolean("in_drinks"),
-                        o.getBoolean("in_food"),
-                        o.getBoolean("in_wine")
-                    )
-                }
-                runOnUiThread { onDone() }
-            }
-        })
-    }
-
-    /** Theken-Abbruch: Session invalidieren, UI räumen. */
-    private fun posCancel(onCleared: () -> Unit) {
-        val sid = scanSessionId
-        if (sid == null) {
-            onCleared()
-            return
-        }
-        val req = Request.Builder()
-            .url("$apiBaseUrl/pos/cancel")
-            .post(ByteArray(0).toRequestBody(null))
-            .addHeader("X-Scan-Session", sid)
-            .build()
-        client.newCall(req).enqueue(object: Callback {
-            override fun onFailure(call: Call, e: IOException) = runOnUiThread {
-                // zur Sicherheit trotzdem lokal leeren
-                clearLocalScanSession()
-                onCleared()
-            }
-            override fun onResponse(call: Call, resp: Response) = runOnUiThread {
-                clearLocalScanSession()
-                onCleared()
-            }
-        })
-    }
-
-    /** Bezahlen in der Theke: /charge mit X-Scan-Session; Server verbraucht Session. */
-    private fun postChargeWithSession(total: Double, items: JSONArray, onDone: (Boolean, JSONObject?) -> Unit) {
-        val sid = scanSessionId
-        thekeBuildProducts = null  // während Zahlung UI-Neuaufbau blocken (optional)
-        val uid = currentUID
-        if (sid == null || uid == null) {
-            Toast.makeText(this, "Bitte Band scannen", Toast.LENGTH_SHORT).show()
-            onDone(false, null)
-            return
-        }
-        val body = JSONObject().apply {
-            put("amount", total)
-            put("items", items)
-        }.toString().toRequestBody("application/json".toMediaType())
-
-        val req = Request.Builder()
-            .url("$apiBaseUrl/charge")
-            .post(body)
-            .addHeader("X-Scan-Session", sid)
-            .build()
-
-        client.newCall(req).enqueue(object: Callback {
-            override fun onFailure(call: Call, e: IOException) = runOnUiThread {
-                Toast.makeText(this@MainActivity, "Bezahlung fehlgeschlagen", Toast.LENGTH_SHORT).show()
-                onDone(false, null)
-            }
-            override fun onResponse(call: Call, resp: Response) {
-                val text = resp.body?.string() ?: "{}"
-                val json = JSONObject(text)
-                runOnUiThread {
-                    if (resp.isSuccessful) {
-                        // Server hat Session verbraucht -> lokal ebenfalls löschen
-                        clearLocalScanSession()
-                        // Balance aktualisieren
-                        checkBalance(uid) { thekeRefreshTotals?.invoke() }
-                        onDone(true, json.optJSONObject("order"))
+        if (admin) configureAdminTabs(page, container, view)
+        val address = view.findViewById<EditText>(R.id.edtBaseUrl)
+        val code = view.findViewById<EditText>(R.id.edtApiKey).apply { isSaveEnabled = false }
+        val useHid = view.findViewById<Switch>(R.id.switchHidScanner)
+        address.setText(settings.getString(BASE_PREF, DEFAULT_BASE))
+        code.hint = if (keyStore.read() == null) "Registrierungscode eingeben" else "Zum Ändern neuen Gerätecode eingeben"
+        useHid.isChecked = isHidEnabled()
+        val savable = bookings.pending == null && !unusablePending
+        view.findViewById<Button>(R.id.btnSaveBaseUrl).apply {
+            isEnabled = savable
+            setOnClickListener {
+                if (bookings.pending != null) return@setOnClickListener
+                val base = validatedBase(address.text.toString())
+                val deviceCode = code.text.toString().trim()
+                val oldBase = settings.getString(BASE_PREF, DEFAULT_BASE)?.toHttpUrlOrNull()
+                if (base == null) {
+                    notifyUser("Bitte eine gültige HTTPS-Adresse eingeben.")
+                } else if (deviceCode.isEmpty() && (keyStore.read() == null || oldBase != base)) {
+                    notifyUser("Bitte den Gerätecode für diese Kasse eingeben.")
+                } else if (deviceCode.isNotEmpty() && !deviceCode.matches(Regex("[!-~]{8,256}"))) {
+                    notifyUser("Der Gerätecode hat ein ungültiges Format.")
+                } else {
+                    val editor = settings.edit().putString(BASE_PREF, base.toString()).putBoolean(HID_PREF, useHid.isChecked)
+                    val saved = if (deviceCode.isEmpty()) editor.commit() else keyStore.save(deviceCode, editor)
+                    if (saved) {
+                        startScanner()
+                        showHome()
                     } else {
-                        Toast.makeText(this@MainActivity, json.optString("error","Bezahlung fehlgeschlagen"), Toast.LENGTH_SHORT).show()
-                        onDone(false, null)
+                        notifyUser(if (Build.VERSION.SDK_INT < 23) "Geräteanmeldung benötigt Android 6 oder neuer." else "Die Geräteverbindung konnte nicht sicher gespeichert werden.")
                     }
                 }
             }
-        })
-    }
-
-    // ------------------------------------------------------------
-    // Bisherige Netzwerkroutinen (Admin/Kasse)
-    // ------------------------------------------------------------
-
-    /** Admin/Katalog: vollständige Produktliste (ohne Scan-Gate) */
-    private fun loadProducts(onDone: () -> Unit) {
-        client.newCall(Request.Builder().url("$apiBaseUrl/products").get().build())
-            .enqueue(object : Callback {
-                override fun onFailure(call: Call, e: IOException) = runOnUiThread {
-                    Toast.makeText(this@MainActivity, "Fehler beim Laden der Produkte", Toast.LENGTH_SHORT).show()
-                    onDone()
-                }
-                override fun onResponse(call: Call, response: Response) {
-                    val arr = JSONArray(response.body?.string() ?: "[]")
-                    productsCache = (0 until arr.length()).map { i ->
-                        val o = arr.getJSONObject(i)
-                        Product(
-                            o.getInt("id"),
-                            o.getString("name"),
-                            o.getDouble("price"),
-                            o.getBoolean("in_drinks"),
-                            o.getBoolean("in_food"),
-                            o.getBoolean("in_wine")
-                        )
+        }
+        view.findViewById<Button>(R.id.btnResetBaseUrl).apply {
+            isEnabled = savable
+            setOnClickListener {
+                trackDialog(AlertDialog.Builder(this@MainActivity)
+                    .setTitle("Geräteverbindung entfernen?")
+                    .setNegativeButton("Abbrechen", null)
+                    .setPositiveButton("Entfernen") { _, _ ->
+                        if (bookings.pending == null && keyStore.clear(settings.edit().remove(BASE_PREF))) {
+                            showHome()
+                        } else notifyUser("Die Geräteverbindung konnte nicht entfernt werden.")
                     }
-                    runOnUiThread { onDone() }
-                }
-            })
+                    .create())
+            }
+        }
     }
 
-    private fun checkBalance(uid: String, onUpdated: (() -> Unit)? = null) {
-        client.newCall(Request.Builder().url("$apiBaseUrl/balance/$uid").build())
-            .enqueue(object : Callback {
-                override fun onFailure(call: Call, e: IOException) = runOnUiThread {
-                    currentBalance = 0.0
-                    updateStatusCards(error = true)
-                    onUpdated?.invoke()
-                    Toast.makeText(this@MainActivity, "Verbindung fehlgeschlagen", Toast.LENGTH_SHORT).show()
+    private fun configureAdminTabs(page: View, container: FrameLayout, settingsView: View) {
+        val session = areaSession ?: return
+        val api = api() ?: return
+        page.findViewById<View>(R.id.adminTabs).isVisible = true
+        page.findViewById<View>(R.id.tabProducts).isVisible = false
+        page.findViewById<View>(R.id.tabUsers).isVisible = false
+        page.findViewById<Button>(R.id.tabSettings).setOnClickListener {
+            container.removeAllViews()
+            container.addView(settingsView)
+        }
+        page.findViewById<Button>(R.id.tabCounter).apply {
+            text = "Kassenübersicht"
+            setOnClickListener {
+                AdminReportView(this@MainActivity, api, session.token, ::money, ::notifyUser, ::saveCsv).show(container)
+            }
+        }
+    }
+
+    private fun saveCsv(csv: String) {
+        csvForExport = csv
+        val picker = Intent(Intent.ACTION_CREATE_DOCUMENT)
+            .addCategory(Intent.CATEGORY_OPENABLE)
+            .setType("text/csv")
+            .putExtra(Intent.EXTRA_TITLE, "odentaler-transaktionen.csv")
+        try {
+            @Suppress("DEPRECATION")
+            startActivityForResult(picker, SAVE_CSV_REQUEST)
+        } catch (_: android.content.ActivityNotFoundException) {
+            csvForExport = null
+            notifyUser("Auf diesem Gerät ist keine Dateiauswahl verfügbar.")
+        }
+    }
+
+    private fun renderAdminAreas(page: View) {
+        val session = areaSession ?: return
+        val api = api() ?: return
+        val parent = page as LinearLayout
+        val wineRow = page.findViewById<View>(R.id.wineSwitchRow)
+        val mobile = Switch(this).apply {
+            text = "Mobile Bedienung aktivieren"
+            minHeight = (48 * resources.displayMetrics.density).toInt()
+        }
+        parent.addView(mobile, parent.indexOfChild(wineRow) + 1)
+        val switches = mapOf("wine" to page.findViewById<Switch>(R.id.switchWine), "mobile" to mobile)
+        switches.values.forEach { it.isEnabled = false }
+        val screen = screenGeneration
+        api.request("admin/areas", token = session.token) { reply ->
+            onScreen(screen) {
+                val areas = reply.objectBody()
+                if (!reply.successful || areas == null) {
+                    notifyUser("Die Bereiche konnten nicht geladen werden.")
+                    return@onScreen
                 }
-                override fun onResponse(call: Call, response: Response) {
-                    val bal = try {
-                        JSONObject(response.body?.string() ?: "{}").optDouble("balance", 0.0)
-                    } catch (_: Exception) { 0.0 }
-                    runOnUiThread {
-                        currentBalance = bal
-                        updateStatusCards()
-                        onUpdated?.invoke()
+                for ((area, control) in switches) {
+                    var saved = areas.optBoolean(area)
+                    control.isChecked = saved
+                    control.isEnabled = true
+                    control.setOnCheckedChangeListener { _, enabled ->
+                        if (saved != enabled) {
+                            control.isEnabled = false
+                            val payload = JSONObject().put("enabled", enabled).toString()
+                            api.request("admin/areas/$area", "PUT", payload, session.token) { result ->
+                                onScreen(screen) {
+                                    if (result.successful) saved = enabled
+                                    else {
+                                        control.isChecked = saved
+                                        notifyUser("Die Änderung konnte nicht bestätigt werden.")
+                                    }
+                                    control.isEnabled = true
+                                }
+                            }
+                        }
                     }
                 }
-            })
+            }
+        }
     }
 
-    /** Kasse: load/refund/charge ohne Scan-Session (bleibt wie gehabt, aber Kasse ist scan-first via UI) */
-    private fun sendTransaction(type: String, amount: Double, onDone: (() -> Unit)? = null) {
-        val uid = currentUID ?: run {
-            Toast.makeText(this, "Bitte erst scannen", Toast.LENGTH_SHORT).show()
+    private fun showCash() {
+        val view = installLayout(R.layout.view_kasse)
+        view.findViewById<Button>(R.id.btnBackKasse).setOnClickListener { leaveScreen() }
+        view.findViewById<Button>(R.id.btnLoadTokens).apply {
+            text = "Guthaben aufladen"
+            setOnClickListener { openAmountDialog(refund = false) }
+        }
+        view.findViewById<Button>(R.id.btnRefund).setOnClickListener { openAmountDialog(refund = true) }
+        renderSalesState()
+    }
+
+    private fun showCounter(area: String) {
+        val view = installLayout(R.layout.view_theke)
+        view.findViewById<Button>(R.id.btnBackTheke).setOnClickListener { leaveScreen() }
+        view.findViewById<Button>(R.id.btnPay).setOnClickListener { confirmSale() }
+        view.findViewById<Button>(R.id.btnCancel).setOnClickListener {
+            if (cart.isEmpty()) cancelScan()
+            else trackDialog(AlertDialog.Builder(this)
+                .setTitle("Warenkorb verwerfen?")
+                .setNegativeButton("Weiter bestellen", null)
+                .setPositiveButton("Verwerfen") { _, _ -> cancelScan() }
+                .create())
+        }
+        title = when (area) {
+            "drinks" -> "Getränketheke"
+            "food" -> "Essenstheke"
+            "wine" -> "Weintheke"
+            else -> "Mobile Bedienung"
+        }
+        renderSalesState()
+    }
+
+    private fun startScanner() {
+        nfc.stop()
+        hid.stop()
+        if (isHidEnabled()) {
+            hid.start()
+            hid.observeConnection(this) {
+                if (canScan()) showMessage("Bluetooth-Scanner getrennt. Bitte Verbindung prüfen.")
+                else if (areaSession?.area?.let { it != ADMIN } == true) {
+                    notifyUser("Bluetooth-Scanner getrennt. Bitte Verbindung prüfen.")
+                }
+            }
+        } else nfc.start()
+    }
+
+    private fun canScan(): Boolean =
+        active && areaSession?.area?.let { it != ADMIN } == true && dialog == null &&
+            !requestRunning && bookings.pending == null && !unusablePending && scan == null && !scanLoading
+
+    private fun acceptScan(uid: String) {
+        if (!canScan() || !scanDebouncer.accept(uid, SystemClock.elapsedRealtime())) return
+        val session = areaSession ?: return
+        val api = api() ?: return
+        val event = eventConfig ?: return
+        val screen = screenGeneration
+        val generation = ++scanGeneration
+        val scanRequestedAt = SystemClock.elapsedRealtime()
+        scanLoading = true
+        clearMessage()
+        renderSalesState()
+        api.request("scans", "POST", JSONObject().put("uid", uid).toString(), session.token) { reply ->
+            onScreen(screen) {
+                if (generation != scanGeneration) return@onScreen
+                scanLoading = false
+                val body = reply.objectBody()
+                val id = body?.optString("scan_id")?.takeIf(::validUuid)
+                val balance = body?.optLong("balance_cents", -1) ?: -1
+                if (!reply.successful || body?.optString("uid") != uid || id == null || balance < 0) {
+                    renderSalesState()
+                    when (reply.error) {
+                        "session_unauthorized" -> {
+                            showHome()
+                            notifyUser("Bitte den Bereich erneut öffnen.")
+                        }
+                        "account_not_found" -> showMessage("Dieses Armband ist nicht registriert.")
+                        else -> showMessage("Das Armband konnte nicht gelesen werden. Bitte Verbindung prüfen.")
+                    }
+                    return@onScreen
+                }
+                val remaining = body.optLong("expires_in_ms", 0).coerceIn(0, event.timeoutMillis)
+                val deadline = scanRequestedAt + remaining
+                if (deadline <= SystemClock.elapsedRealtime()) {
+                    renderSalesState()
+                    showMessage("Die Scanzeit ist abgelaufen. Bitte das Armband erneut scannen.")
+                    return@onScreen
+                }
+                scan = Scan(id, balance, deadline)
+                scheduleExpiry(event.timeoutMillis)
+                if (session.area != CASH) loadProducts(api, session, screen, generation)
+                else renderSalesState()
+            }
+        }
+    }
+
+    private fun loadProducts(api: OdentalerApi, session: AreaSession, screen: Long, generation: Long) {
+        scanLoading = true
+        renderSalesState()
+        api.request("products", token = session.token) { reply ->
+            onScreen(screen) {
+                if (generation != scanGeneration) return@onScreen
+                scanLoading = false
+                val catalog = if (reply.successful) decodeProducts(reply.arrayBody()) else null
+                if (catalog == null) {
+                    cancelScan()
+                    showMessage("Die Produkte konnten nicht geladen werden. Bitte Verbindung prüfen.")
+                } else {
+                    products = catalog
+                    renderSalesState()
+                }
+            }
+        }
+    }
+
+    private fun renderSalesState() {
+        val session = areaSession ?: return
+        if (session.area == ADMIN) return
+        val activeScan = scan
+        val pending = bookings.pending
+        val scanReady = activeScan != null && SystemClock.elapsedRealtime() < activeScan.deadline && !scanLoading
+        val ready = scanReady && !requestRunning && pending == null
+        val prompt = when {
+            requestRunning -> "Buchung wird geprüft …"
+            pending != null -> "Buchung noch offen."
+            scanLoading -> "Armband wird geprüft …"
+            !isHidEnabled() && !nfc.isAvailable -> "Dieses Gerät hat keinen NFC-Leser."
+            !isHidEnabled() && !nfc.isEnabled -> "Bitte NFC in Android aktivieren."
+            else -> "Bitte Armband scannen."
+        }
+        if (session.area == CASH) {
+            mainContent.findViewById<TextView>(R.id.kasseScanHint)?.apply {
+                isVisible = !scanReady && pending == null
+                text = prompt
+            }
+            mainContent.findViewById<TextView>(R.id.uidInfo)?.apply {
+                isVisible = scanReady
+                text = activeScan?.let { "Guthaben  ${money(it.balanceCents)}" }.orEmpty()
+            }
+            mainContent.findViewById<Button>(R.id.btnLoadTokens)?.isEnabled = ready
+            mainContent.findViewById<Button>(R.id.btnRefund)?.isEnabled = ready && (activeScan?.balanceCents ?: 0) > 0
             return
         }
-        val json = JSONObject().apply {
-            put("uid", uid)
-            if (type != "refund") put("amount", amount)
+
+        mainContent.findViewById<LinearLayout>(R.id.productList)?.apply {
+            removeAllViews()
+            if (scanReady) {
+                var category: String? = null
+                for (product in products) {
+                    if (product.category.isNotBlank() && product.category != category) {
+                        category = product.category
+                        addView(TextView(this@MainActivity).apply {
+                            text = category
+                            textSize = 20f
+                        })
+                    }
+                    val row = layoutInflater.inflate(R.layout.item_product_row, this, false)
+                    row.findViewById<TextView>(R.id.txtProductName).text = product.name
+                    row.findViewById<TextView>(R.id.txtProductPrice).text = money(product.priceCents)
+                    val quantity = row.findViewById<TextView>(R.id.txtQty)
+                    val minus = row.findViewById<Button>(R.id.btnMinus)
+                    val plus = row.findViewById<Button>(R.id.btnPlus)
+                    fun updateQuantity(count: Int) {
+                        quantity.text = count.toString()
+                        minus.isEnabled = ready && count > 0
+                        plus.isEnabled = ready && count < 999
+                    }
+                    minus.contentDescription = "${product.name} entfernen"
+                    plus.contentDescription = "${product.name} hinzufügen"
+                    minus.setOnClickListener { changeQuantity(product, -1)?.let(::updateQuantity) }
+                    plus.setOnClickListener { changeQuantity(product, 1)?.let(::updateQuantity) }
+                    updateQuantity(cart[product.id] ?: 0)
+                    addView(row)
+                }
+                if (products.isEmpty()) addView(TextView(this@MainActivity).apply { text = "Für diesen Bereich sind keine Produkte freigegeben." })
+            }
         }
-        val body = json.toString().toRequestBody("application/json".toMediaType())
-        client.newCall(Request.Builder().url("$apiBaseUrl/$type").post(body).build())
-            .enqueue(object : Callback {
-                override fun onFailure(call: Call, e: IOException) = runOnUiThread {
-                    Toast.makeText(this@MainActivity, "Transaktionsfehler", Toast.LENGTH_SHORT).show()
+        renderTotals(prompt)
+    }
+
+    private fun changeQuantity(product: Product, delta: Int): Int? {
+        if (validScan() == null) return null
+        val count = ((cart[product.id] ?: 0) + delta).coerceIn(0, 999)
+        if (count == 0) cart.remove(product.id) else cart[product.id] = count
+        renderTotals("")
+        return count
+    }
+
+    private fun renderTotals(prompt: String) {
+        val activeScan = scan
+        val total = cartTotal()
+        mainContent.findViewById<TextView>(R.id.tokenDisplay)?.text = if (activeScan == null || scanLoading) prompt
+            else "Guthaben  ${money(activeScan.balanceCents)}\nWarenkorb  ${money(total)}"
+        mainContent.findViewById<TextView>(R.id.tokenWarning)?.apply {
+            isVisible = activeScan != null && total > activeScan.balanceCents
+            text = "Guthaben reicht nicht aus."
+        }
+        mainContent.findViewById<Button>(R.id.btnPay)?.isEnabled =
+            activeScan != null && total in 1..activeScan.balanceCents &&
+                !requestRunning && !scanLoading && bookings.pending == null
+        mainContent.findViewById<Button>(R.id.btnCancel)?.isEnabled =
+            activeScan != null && !requestRunning && bookings.pending == null
+    }
+
+    private fun cartTotal(): Long = products.sumOf { it.priceCents * (cart[it.id] ?: 0) }
+
+    private fun openAmountDialog(refund: Boolean) {
+        val band = validScan() ?: return
+        val fullRefund = band.balanceCents.takeIf { it > 0 }
+        val amount = EditText(this).apply {
+            hint = "z. B. 12,50"
+            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+            setSingleLine()
+        }
+        val form = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            val padding = (24 * resources.displayMetrics.density).toInt()
+            setPadding(padding, 0, padding, 0)
+            addView(TextView(this@MainActivity).apply { text = "Guthaben  ${money(band.balanceCents)}" })
+            val amounts = if (refund) listOfNotNull(fullRefund) else eventConfig?.presetCents.orEmpty()
+            amounts.take(8).chunked(2).forEach { pair ->
+                addView(LinearLayout(this@MainActivity).apply {
+                    pair.forEach { cents ->
+                        addView(Button(this@MainActivity).apply {
+                            text = if (refund) "Gesamt ${money(cents)}" else money(cents)
+                            setOnClickListener {
+                                amount.setText(BigDecimal.valueOf(cents, 2).toPlainString().replace('.', ','))
+                            }
+                        }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+                    }
+                })
+            }
+            addView(amount)
+        }
+
+        val picker = AlertDialog.Builder(this)
+            .setTitle(if (refund) "Auszahlungsbetrag" else "Aufladebetrag")
+            .setView(form)
+            .setNegativeButton("Abbrechen", null)
+            .setPositiveButton("Weiter", null)
+            .create()
+        trackDialog(picker)
+        picker.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+            val cents = parsePositiveCents(amount.text.toString())
+            if (cents == null || (refund && cents > band.balanceCents)) {
+                amount.error = "Bitte einen gültigen Betrag eingeben."
+            } else {
+                picker.dismiss()
+                val kind = if (refund) "refund" else "topup"
+                confirmBooking(
+                    band,
+                    if (refund) "${money(cents)} bar auszahlen?" else "Barzahlung über ${money(cents)} erhalten?",
+                    if (refund) "Nach der Bestätigung das Bargeld ausgeben." else "Bitte erst buchen, wenn das Bargeld entgegengenommen wurde.",
+                    JSONObject().put("kind", kind).put("scan_id", band.id)
+                        .put("amount_cents", cents).put("payment_method", "cash")
+                )
+            }
+        }
+    }
+
+    private fun confirmSale() {
+        val band = validScan() ?: return
+        val total = cartTotal()
+        if (total !in 1..band.balanceCents) return
+        val selected = products.mapNotNull { product ->
+            val quantity = cart[product.id] ?: return@mapNotNull null
+            product to quantity
+        }
+        val note = selected.joinToString("\n") { (product, quantity) -> "${product.name} × $quantity" }
+        val items = JSONArray()
+        selected.forEach { (product, quantity) ->
+            items.put(JSONObject().put("product_id", product.id).put("quantity", quantity)
+                .put("unit_price_cents", product.priceCents))
+        }
+        confirmBooking(
+            band, "${money(total)} abbuchen?", note,
+            JSONObject().put("kind", "sale").put("scan_id", band.id).put("items", items),
+            note
+        )
+    }
+
+    private fun confirmBooking(band: Scan, title: String, message: String, payload: JSONObject, note: String = "") {
+        trackDialog(AlertDialog.Builder(this)
+            .setTitle(title)
+            .setMessage(message)
+            .setNegativeButton("Abbrechen", null)
+            .setPositiveButton("Buchung bestätigen") { _, _ ->
+                if (validScan() != band) {
+                    notifyUser("Die Scanzeit ist abgelaufen. Bitte erneut scannen.")
+                    return@setPositiveButton
                 }
-                override fun onResponse(call: Call, response: Response) = runOnUiThread {
-                    checkBalance(uid) { onDone?.invoke() }
+                val session = areaSession ?: return@setPositiveButton
+                val api = api() ?: return@setPositiveButton
+                val pending = bookings.begin(session.eventId, session.area, payload.toString())
+                if (pending == null) {
+                    showMessage("Die Buchung konnte nicht sicher vorbereitet werden.")
+                    return@setPositiveButton
                 }
+                requestRunning = true
+                renderSalesState()
+                postBooking(api, session, pending, screenGeneration, note)
+            }
+            .create())
+    }
+
+    private fun postBooking(api: OdentalerApi, session: AreaSession, pending: PendingBooking, screen: Long, note: String = "") {
+        api.request("transactions", "POST", pending.payload, session.token, pending.key) { reply ->
+            onScreen(screen) { processBooking(pending, reply, note) }
+        }
+    }
+
+    private fun showPending() {
+        val pending = bookings.pending ?: return
+        val session = areaSession ?: return
+        if (pending.eventId != session.eventId || pending.area != session.area) return
+        val check = View.OnClickListener { recoverBooking(pending, session) }
+        if (session.area == CASH) {
+            mainContent.findViewById<Button>(R.id.btnLoadTokens)?.apply {
+                text = "Buchung prüfen"
+                isEnabled = !requestRunning
+                setOnClickListener(check)
+            }
+        } else {
+            mainContent.findViewById<Button>(R.id.btnPay)?.apply {
+                text = "Buchung prüfen"
+                isEnabled = !requestRunning
+                setOnClickListener(check)
+            }
+        }
+        showMessage("Buchung noch offen. Bitte erst prüfen.\nReferenz ${pending.key.takeLast(8)}")
+    }
+
+    private fun recoverBooking(pending: PendingBooking, session: AreaSession) {
+        val api = api() ?: return
+        if (requestRunning || pending != bookings.pending) return
+        requestRunning = true
+        renderSalesState()
+        showMessage("Buchung wird geprüft …")
+        val screen = screenGeneration
+        api.request("transactions/${pending.key}", token = session.token) { reply ->
+            onScreen(screen) {
+                if (bookingAction(reply.status, reply.error, confirmed = false, lookup = true) == BookingAction.RETRY_SAME) {
+                    postBooking(api, session, pending, screen)
+                } else processBooking(pending, reply, note = "")
+            }
+        }
+    }
+
+    private fun processBooking(pending: PendingBooking, reply: ApiReply, note: String) {
+        requestRunning = false
+        if (!active) return
+        val body = reply.objectBody()
+        val id = body?.optString("id")?.takeIf(::validUuid)
+        val booked = body?.optLong("amount_cents", -1) ?: -1
+        val balance = body?.optLong("balance_after_cents", -1) ?: -1
+        val priorBalance = body?.optLong("balance_before_cents", -1) ?: -1
+        val kind = body?.optString("kind")
+        val payload = JSONObject(pending.payload)
+        val expectedKind = payload.optString("kind")
+        val expected = if (expectedKind == "sale") {
+            val lines = payload.getJSONArray("items")
+            (0 until lines.length()).sumOf { index ->
+                val line = lines.getJSONObject(index)
+                line.getLong("unit_price_cents") * line.getInt("quantity")
+            }
+        } else payload.optLong("amount_cents", -1)
+        val balanceChange = if (kind == "topup") balance - priorBalance else priorBalance - balance
+        val confirmed = reply.successful && id != null && booked > 0 && booked == expected &&
+            balance >= 0 && priorBalance >= 0 && balanceChange == booked && kind == expectedKind
+        val outcome = bookingAction(reply.status, reply.error, confirmed)
+        if (outcome == BookingAction.UNRESOLVED || !bookings.finish(pending.key)) {
+            clearScan()
+            renderSalesState()
+            showPending()
+            if (reply.error == "session_unauthorized") notifyUser("Bitte zurückgehen und den Bereich erneut öffnen.")
+            return
+        }
+
+        val area = areaSession?.area ?: return
+        if (area == CASH) showCash() else showCounter(area)
+        if (confirmed) {
+            val confirmation = when (kind) {
+                "topup" -> "Aufgeladen  ${money(booked)}"
+                "refund" -> "Auszahlung verbucht  ${money(booked)}"
+                else -> "Bezahlt  ${money(booked)}"
+            }
+            val detail = if (note.isBlank()) "" else "\n$note"
+            showMessage("$confirmation\nNeues Guthaben  ${money(balance)}$detail", success = true)
+        } else {
+            showMessage(when (reply.error) {
+                "insufficient_balance" -> "Guthaben reicht nicht aus. Bitte erneut scannen."
+                "balance_limit" -> "Der Betrag überschreitet das erlaubte Guthaben."
+                "price_changed" -> "Ein Preis wurde geändert. Bitte Bestellung neu erfassen."
+                "product_unavailable" -> "Ein Produkt ist nicht mehr verfügbar. Bitte Bestellung neu erfassen."
+                "scan_expired", "scan_closed", "scan_not_found" -> "Die Scanzeit ist abgelaufen. Bitte erneut scannen."
+                else -> "Die Buchung wurde abgelehnt. Bitte erneut scannen."
             })
+        }
     }
 
-    // ------------------------------------------------------------
-    // ADMIN: PRODUKTE CRUD
-    // ------------------------------------------------------------
-    private fun promptNewProduct(onSaved: () -> Unit) {
-        val nameInp = EditText(this).apply { hint = "Name" }
-        val priceInp = EditText(this).apply {
-            hint = "Preis"
-            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
-        }
-        val drinksCb = CheckBox(this).apply { text = "Getränke" }
-        val foodCb = CheckBox(this).apply { text = "Essen" }
-        val wineCb = CheckBox(this).apply { text = "Wein" }
+    private fun validScan(): Scan? = scan?.takeIf {
+        !scanLoading && !requestRunning && bookings.pending == null && SystemClock.elapsedRealtime() < it.deadline
+    }
 
-        val dlg = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(12), dp(12), dp(12), dp(12))
-            addView(nameInp); addView(priceInp); addView(drinksCb); addView(foodCb); addView(wineCb)
-        }
-
-        AlertDialog.Builder(this)
-            .setTitle("Neues Produkt")
-            .setView(dlg)
-            .setPositiveButton("Speichern") { _, _ ->
-                val json = JSONObject().apply {
-                    put("name", nameInp.text.toString())
-                    put("price", priceInp.text.toString().toDoubleOrNull() ?: 0.0)
-                    put("in_drinks", drinksCb.isChecked)
-                    put("in_food", foodCb.isChecked)
-                    put("in_wine", wineCb.isChecked)
+    private fun scheduleExpiry(timeout: Long) {
+        val band = scan ?: return
+        val expiry = Runnable {
+            if (scan == band) {
+                if (bookings.pending == null) {
+                    dialog?.dismiss()
+                    cancelScan()
+                    showMessage("Die Scanzeit ist abgelaufen. Bitte das Armband erneut scannen.")
+                } else {
+                    clearScan()
+                    renderSalesState()
                 }
-                val body = json.toString().toRequestBody("application/json".toMediaType())
-                client.newCall(Request.Builder().url("$apiBaseUrl/products").post(body).build())
-                    .enqueue(object : Callback {
-                        override fun onFailure(call: Call, e: IOException) = runOnUiThread {
-                            Toast.makeText(this@MainActivity, "Fehler", Toast.LENGTH_SHORT).show()
-                        }
-                        override fun onResponse(call: Call, response: Response) = runOnUiThread { onSaved() }
-                    })
             }
-            .setNegativeButton("Abbrechen", null)
-            .show()
+        }
+        scanExpiry = expiry
+        mainHandler.postDelayed(expiry, (band.deadline - SystemClock.elapsedRealtime()).coerceIn(0, timeout))
     }
 
-    private fun promptEditProduct(
-        id: Int,
-        name: String,
-        price: Double,
-        dr: Boolean,
-        fd: Boolean,
-        wn: Boolean,
-        onSaved: () -> Unit
-    ) {
-        val nameInp = EditText(this).apply { setText(name) }
-        val priceInp = EditText(this).apply {
-            setText(price.toString())
-            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
-        }
-        val drinksCb = CheckBox(this).apply { text = "Getränke"; isChecked = dr }
-        val foodCb = CheckBox(this).apply { text = "Essen"; isChecked = fd }
-        val wineCb = CheckBox(this).apply { text = "Wein"; isChecked = wn }
-
-        val dlg = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(12), dp(12), dp(12), dp(12))
-            addView(nameInp); addView(priceInp); addView(drinksCb); addView(foodCb); addView(wineCb)
-        }
-
-        AlertDialog.Builder(this)
-            .setTitle("Produkt bearbeiten")
-            .setView(dlg)
-            .setPositiveButton("Speichern") { _, _ ->
-                val json = JSONObject().apply {
-                    put("name", nameInp.text.toString())
-                    put("price", priceInp.text.toString().toDoubleOrNull() ?: price)
-                    put("in_drinks", drinksCb.isChecked)
-                    put("in_food", foodCb.isChecked)
-                    put("in_wine", wineCb.isChecked)
+    private fun cancelScan() {
+        val session = areaSession
+        val id = scan?.id
+        clearScan()
+        renderSalesState()
+        if (id != null && session != null) {
+            val api = api() ?: return
+            val screen = screenGeneration
+            val generation = scanGeneration
+            scanLoading = true
+            renderSalesState()
+            api.request("scans/$id", "DELETE", token = session.token) {
+                onScreen(screen) {
+                    if (generation == scanGeneration) {
+                        scanLoading = false
+                        renderSalesState()
+                    }
                 }
-                val body = json.toString().toRequestBody("application/json".toMediaType())
-                client.newCall(Request.Builder().url("$apiBaseUrl/products/$id").put(body).build())
-                    .enqueue(object : Callback {
-                        override fun onFailure(c: Call, e: IOException) = runOnUiThread {
-                            Toast.makeText(this@MainActivity, "Fehler", Toast.LENGTH_SHORT).show()
-                        }
-                        override fun onResponse(c: Call, r: Response) = runOnUiThread { onSaved() }
-                    })
             }
-            .setNegativeButton("Abbrechen", null)
-            .show()
-    }
-
-    // ------------------------------------------------------------
-    // STATUS-UI
-    // ------------------------------------------------------------
-    private fun updateStatusCards(error: Boolean = false) {
-        // Home-Statuskarte
-        (mainContent.findViewById<TextView?>(R.id.statusCard))?.let { tv ->
-            tv.text = if (error) "Fehler beim Abrufen"
-            else "Letzte UID: ${currentUID ?: "-"}\nChips: %.2f".format(currentBalance)
-        }
-        // Kasse-Statuskarte
-        (mainContent.findViewById<TextView?>(R.id.kasseStatusCard))?.let { tv ->
-            tv.text = if (error) "Fehler beim Abrufen"
-            else "Letzte UID: ${currentUID ?: "-"}\nChips: %.2f".format(currentBalance)
         }
     }
 
-    // ------------------------------------------------------------
-    // CHAT (optional)
-    // ------------------------------------------------------------
-    private fun openChat() {
-        try {
-            startActivity(Intent(this, Class.forName("com.mockschan.cashless.ChatActivity")))
-        } catch (_: Exception) {
-            Toast.makeText(this, "Chat noch nicht verfügbar", Toast.LENGTH_SHORT).show()
+    private fun clearScan() {
+        scanGeneration++
+        scanExpiry?.let(mainHandler::removeCallbacks)
+        scanExpiry = null
+        scan = null
+        scanLoading = false
+        cart.clear()
+        products = emptyList()
+        if (::hid.isInitialized) hid.reset()
+    }
+
+    private fun leaveScreen() {
+        if (requestRunning) {
+            notifyUser("Bitte warten, bis die Buchung geprüft ist.")
+            return
         }
+        if (cart.isNotEmpty() && bookings.pending == null) {
+            trackDialog(AlertDialog.Builder(this)
+                .setTitle("Warenkorb verwerfen?")
+                .setNegativeButton("Weiter bestellen", null)
+                .setPositiveButton("Verwerfen") { _, _ -> cancelScan(); showHome() }
+                .create())
+            return
+        }
+        if (bookings.pending == null) cancelScan()
+        showHome()
+    }
+
+    private fun showMessage(text: String, success: Boolean = false) {
+        clearMessage()
+        val banner = mainContent.findViewById<TextView>(R.id.kasseStatusCard)
+            ?: mainContent.findViewById(R.id.orderNote) ?: return
+        banner.text = text
+        banner.isVisible = true
+        banner.setTextColor(if (success) 0xff116135.toInt() else 0xff8f2b15.toInt())
+        if (success) {
+            val hide = Runnable { banner.isVisible = false }
+            messageExpiry = hide
+            mainHandler.postDelayed(hide, 120_000L)
+        }
+    }
+
+    private fun clearMessage() {
+        messageExpiry?.let(mainHandler::removeCallbacks)
+        messageExpiry = null
+        if (::mainContent.isInitialized) {
+            mainContent.findViewById<TextView>(R.id.kasseStatusCard)?.isVisible = false
+            mainContent.findViewById<TextView>(R.id.orderNote)?.isVisible = false
+        }
+    }
+
+    private fun trackDialog(newDialog: AlertDialog) {
+        hid.reset()
+        dialog?.dismiss()
+        dialog = newDialog
+        newDialog.setOnKeyListener { _, _, event ->
+            isHidEnabled() && hid.onKeyEvent(event, captureEnabled = false)
+        }
+        newDialog.setOnDismissListener { if (dialog === newDialog) dialog = null }
+        newDialog.show()
+    }
+
+    private fun onScreen(screen: Long, action: () -> Unit) = runOnUiThread {
+        if (!isFinishing && !isDestroyed && screenGeneration == screen) action()
+    }
+
+    private fun api(): OdentalerApi? {
+        val key = keyStore.read() ?: return null
+        val url = validatedBase(settings.getString(BASE_PREF, DEFAULT_BASE).orEmpty()) ?: return null
+        return OdentalerApi(url, key)
+    }
+
+    private fun validatedBase(value: String): HttpUrl? = value.trim().toHttpUrlOrNull()?.takeIf {
+        it.isHttps && it.username.isEmpty() && it.password.isEmpty() && it.query == null && it.fragment == null
+    }
+
+    private fun notifyUser(text: String) = Toast.makeText(this, text, Toast.LENGTH_LONG).show()
+
+    private fun isHidEnabled() = settings.getBoolean(HID_PREF, false)
+
+    private fun decodeEvent(json: JSONObject?): EventConfig? {
+        if (json == null) return null
+        val id = json.optString("event_id").takeIf(String::isNotBlank) ?: return null
+        val areas = json.optJSONArray("areas") ?: return null
+        val values = json.optJSONArray("topup_amounts_cents") ?: JSONArray()
+        val timeout = json.optLong("scan_timeout_seconds", 120).takeIf { it in 1..3600 } ?: return null
+        return EventConfig(
+            id,
+            json.optString("event_name"),
+            (0 until areas.length()).map { areas.optString(it) }.toSet(),
+            timeout * 1000,
+            (0 until values.length()).map { values.optLong(it) }.filter { it > 0 }
+        )
+    }
+
+    private fun decodeProducts(json: JSONArray?): List<Product>? {
+        if (json == null) return null
+        return runCatching {
+            (0 until json.length()).map { index ->
+                val item = json.getJSONObject(index)
+                val price = item.getLong("price_cents")
+                require(price in 1..Int.MAX_VALUE.toLong())
+                Product(item.getInt("id"), item.getString("name"), price, item.optString("category"))
+            }
+        }.getOrNull()
+    }
+
+    private fun decodePending(json: JSONObject): PendingBooking {
+        val key = json.getString("key")
+        require(validUuid(key))
+        val payload = json.getString("payload")
+        require(JSONObject(payload).optString("kind") in setOf("topup", "refund", "sale"))
+        return PendingBooking(key, json.getString("eventId"), json.getString("area"), payload)
+    }
+
+    private fun encodePending(booking: PendingBooking): String = JSONObject()
+        .put("key", booking.key)
+        .put("eventId", booking.eventId)
+        .put("area", booking.area)
+        .put("payload", booking.payload)
+        .toString()
+
+    private fun validUuid(value: String): Boolean = runCatching {
+        UUID.fromString(value).toString() == value
+    }.getOrDefault(false)
+
+    private fun money(cents: Long): String =
+        NumberFormat.getCurrencyInstance(Locale.GERMANY).format(BigDecimal.valueOf(cents, 2))
+
+    private companion object {
+        const val CASH = "cash"
+        const val ADMIN = "admin"
+        const val BASE_PREF = "apiBaseUrl"
+        const val HID_PREF = "useHidScanner"
+        const val PENDING_PREF = "pendingV1Booking"
+        const val HAD_SCAN_STATE = "hadScanState"
+        const val DEFAULT_BASE = "https://cashless.local"
+        const val SAVE_CSV_REQUEST = 120
     }
 }

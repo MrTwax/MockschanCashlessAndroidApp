@@ -1,70 +1,78 @@
 <?xml version="1.0" encoding="utf-8"?>
-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
     android:id="@+id/kasseRoot"
-    android:orientation="vertical"
-    android:padding="24dp"
     android:layout_width="match_parent"
-    android:layout_height="match_parent">
+    android:layout_height="match_parent"
+    android:fillViewport="true">
 
-    <!-- Zurück -->
-    <Button
-        android:id="@+id/btnBackKasse"
-        android:text="← Zurück"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content" />
-
-    <!-- Hinweis: wird sichtbar wenn kein Band gescannt ist -->
-    <TextView
-        android:id="@+id/kasseScanHint"
+    <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginTop="12dp"
-        android:gravity="center"
-        android:text="Bitte Armband scannen, um aufzuladen oder auszuzahlen."
-        android:textSize="16sp"
-        android:visibility="gone"
-        android:textColor="#D32F2F" />
+        android:orientation="vertical"
+        android:padding="16dp">
 
-    <!-- Aktuelle UID -->
-    <TextView
-        android:id="@+id/uidInfo"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="12dp"
-        android:gravity="center"
-        android:text="Gescannt: -"
-        android:textSize="20sp"
-        android:textStyle="bold" />
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btnBackKasse"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:minHeight="48dp"
+            android:text="@string/operation_back" />
 
-    <!-- Token aufladen -->
-    <Button
-        android:id="@+id/btnLoadTokens"
-        android:text="Token aufladen"
-        android:textSize="22sp"
-        android:layout_marginTop="16dp"
-        android:layout_width="match_parent"
-        android:layout_height="60dp"
-        android:enabled="false" />
+        <TextView
+            android:id="@+id/kasseScanHint"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:accessibilityLiveRegion="polite"
+            android:gravity="center"
+            android:text="@string/operation_scan"
+            android:textSize="18sp"
+            android:visibility="gone" />
 
-    <!-- Guthaben auszahlen -->
-    <Button
-        android:id="@+id/btnRefund"
-        android:text="Guthaben auszahlen"
-        android:textSize="22sp"
-        android:layout_marginTop="12dp"
-        android:layout_width="match_parent"
-        android:layout_height="60dp"
-        android:enabled="false" />
+        <TextView
+            android:id="@+id/kasseStatusCard"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:accessibilityLiveRegion="polite"
+            android:gravity="center"
+            android:padding="16dp"
+            android:textSize="18sp"
+            android:textStyle="bold"
+            android:visibility="gone" />
 
-    <!-- Statuskarte -->
-    <TextView
-        android:id="@+id/kasseStatusCard"
-        android:text="Letzte UID: -\nToken: -"
-        android:textSize="29sp"
-        android:gravity="center"
-        android:padding="16dp"
-        android:layout_marginTop="16dp"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content" />
+        <TextView
+            android:id="@+id/uidInfo"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:accessibilityLiveRegion="polite"
+            android:background="@drawable/odentaler_panel"
+            android:gravity="center"
+            android:padding="20dp"
+            android:text="@string/operation_balance"
+            android:textSize="30sp"
+            android:textStyle="bold"
+            android:visibility="gone" />
 
-</LinearLayout>
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btnLoadTokens"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:enabled="false"
+            android:minHeight="64dp"
+            android:text="@string/operation_load"
+            android:textSize="20sp" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btnRefund"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:enabled="false"
+            android:minHeight="64dp"
+            android:text="@string/operation_refund"
+            android:textSize="20sp" />
+    </LinearLayout>
+</ScrollView>
