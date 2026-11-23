@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.Odentaler" parent="Theme.Material3.Light.NoActionBar">
+        <item name="colorPrimary">#14534A</item>
+        <item name="colorOnPrimary">#FFFFFF</item>
+        <item name="colorPrimaryContainer">#CFEBE4</item>
+        <item name="colorOnPrimaryContainer">#102F2B</item>
+        <item name="colorSurface">#F7FAF9</item>
+        <item name="colorOnSurface">#152523</item>
+        <item name="android:windowBackground">#F7FAF9</item>
+        <item name="android:statusBarColor">#F7FAF9</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:navigationBarColor">#102F2B</item>
+    </style>
+</resources>

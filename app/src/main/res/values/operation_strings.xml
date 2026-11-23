@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="operation_kasse">Kasse</string>
+    <string name="operation_drinks">Getränketheke</string>
+    <string name="operation_food">Essenstheke</string>
+    <string name="operation_wine">Weintheke</string>
+    <string name="operation_mobile">Mobile Bedienung</string>
+    <string name="operation_admin">Einstellungen</string>
+    <string name="operation_back">Zurück</string>
+    <string name="operation_cancel">Abbrechen</string>
+    <string name="operation_pay">Bezahlen</string>
+    <string name="operation_load">Guthaben aufladen</string>
+    <string name="operation_refund">Guthaben auszahlen</string>
+    <string name="operation_scan">Armband an den Leser halten.</string>
+    <string name="operation_balance">Guthaben</string>
+    <string name="operation_select_counter">Theke auswählen</string>
+    <string name="operation_setup">Gerät einrichten</string>
+    <string name="operation_device_code">Gerätecode</string>
+    <string name="operation_device_code_hint">Code für dieses Gerät</string>
+    <string name="operation_external_scanner">Externer NFC-Leser im Tastaturmodus</string>
+    <string name="operation_quantity_decrease">Menge verringern</string>
+    <string name="operation_quantity_increase">Menge erhöhen</string>
+</resources>
