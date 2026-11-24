@@ -45,6 +45,14 @@ Die Spalte „Nachweis“ beschreibt Tests auf Komponentenebene und noch notwend
 | 19 | Preisänderung | Frühere Belegposition behält ihren ursprünglichen Preis. | PostgreSQL-Integration der Preis-Snapshots und des Berichts |
 | 20 | Kassenabschluss und CSV-Export | Summen, Zahlarten, Verbindlichkeit und CSV stimmen mit Journal und Abschluss überein. | Bericht und CSV in PostgreSQL-Integration, verbindlicher Kassenabschluss offen |
 
+## Gerätetest für die Einrichtung per QR-Code
+
+1. In der Browser-Verwaltung ein Testgerät registrieren und die Einrichtungsseite offen lassen. Der QR-Code enthält den Gerätecode als Zugangsdaten.
+2. In der Android-App **Server einrichten** und **QR-Code scannen** wählen. Kamera freigeben und den Einrichtungs-QR-Code erfassen. Die App muss die Serveradresse übernehmen und den Gerätecode verdeckt darstellen.
+3. **Verbinden** wählen. Nach erfolgreicher Prüfung müssen die zugewiesene Testveranstaltung und ihre Bereiche erscheinen. Die bestehende Verbindung muss erhalten bleiben, wenn die Prüfung eines neu gescannten Codes fehlschlägt.
+4. Kamera verweigern, Scan abbrechen und einen gewöhnlichen Webseiten-QR-Code scannen. Prüfen, ob die manuelle Einrichtung weiterhin möglich ist und ob die Gerätekonfiguration bei Abbruch oder ungültigem Code unverändert bleibt.
+5. Auf Smartphone und Tablet mit Android-Kamera prüfen. Der lokale Parser ist durch Android-Unit-Tests abgedeckt. Der optische Scan mit einem physischen Gerät wird gesondert protokolliert.
+
 ## Gerätetest für NFC und Bluetooth-HID
 
 1. Auf einem Gerät mit internem NFC und auf einem Tablet mit externem Lesegerät denselben Testveranstalter und dieselbe Testveranstaltung einrichten. Je Gerät einen separaten Testzugang verwenden.
@@ -68,4 +76,8 @@ Externes HID wird von Android wie eine Tastatur bereitgestellt. Die App kann die
 - Android-Emulator Medium Phone mit API 36. Debug-APK kalt gestartet, Startansicht und Geräteverbindung geöffnet und als Screenshot im IDE-Testlauf erfasst. Statusleistenkontrast und Material-Schaltflächen nach Korrektur erneut visuell geprüft.
 - PostgreSQL 15 im entbehrlichen Testcontainer. 14 Integrationstests bestanden, einschließlich Bericht, CSV und Verwaltung per CLI.
 - Separater Docker-Compose-Test. Datenbank, API und lokaler TLS-Proxy gestartet. Migration zweimal ausgeführt, HTTPS-Gesundheitsprüfung mit Test-CA erfolgreich, Berichtsabruf ohne Anmeldung mit HTTP 401 abgewiesen. PostgreSQL-Dump in eine leere Testdatenbank eingespielt und den Testdatensatz sowie die Migration wiedergefunden.
-- Vollständige Android-Buchungs- und Wiederanlaufabläufe gegen die Test-API sowie NFC, Bluetooth-HID-Hardware, Tablet-/Großschrift-Darstellung und Dauerlast sind offen.
+- Docker-Release 3.2. Image für Linux AMD64 und ARM64 lokal gebaut. Isolierter AMD64-Stack mit `compose.stack.yaml` gestartet. Migration endete mit Exit-Code 0, HTTPS `/healthz` lieferte `ok` und `/v1/bootstrap` ohne Gerätecode lieferte HTTP 401. Das Testprojekt wurde entfernt.
+- Docker-Release 3.3 mit Browser-Verwaltung. 16 PostgreSQL-Integrationstests bestanden. Darunter Anmeldung, CSRF-Abweisung, Veranstalter, Veranstaltung, Geräteschlüssel und Gerätesperre, Produktpflege, PIN-Wechsel und Abruf mit der Android-API. Im isolierten Compose-Stack wurden Login und Speichern eines Veranstalters zusätzlich über die Caddy-HTTPS-Verbindung geprüft.
+- Android 3.4 mit Gradle 8.13 und SDK 36. `:app:bundleRelease :app:assembleDebug :app:testDebugUnitTest` erfolgreich, einschließlich der Tests für QR-Inhalt, Serveradresse und Gerätecode.
+- Backend 3.4. 19 PostgreSQL-Integrationstests bestanden, darunter Token-Schritte, exakte Restauszahlung für Altwerte, Kopieren mit Produkten, geschütztes Löschen und QR-Ausgabe. Das OCI-Archiv enthält geprüfte Manifeste für Linux AMD64 und ARM64.
+- Vollständige Android-Buchungs- und Wiederanlaufabläufe gegen die Test-API sowie der physische QR-Kamerascan, NFC, Bluetooth-HID-Hardware, Tablet-/Großschrift-Darstellung und Dauerlast sind offen.

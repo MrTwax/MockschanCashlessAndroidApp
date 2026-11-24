@@ -4,12 +4,12 @@ import android.app.Activity
 import android.app.AlertDialog
 import android.content.Intent
 import android.content.SharedPreferences
-import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.text.InputType
+import android.text.method.DigitsKeyListener
 import android.view.KeyEvent
 import android.view.View
 import android.widget.Button
@@ -20,6 +20,7 @@ import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
 import androidx.core.view.isVisible
+import com.mockschan.cashless.scan.DeviceQrScanner
 import com.mockschan.cashless.scan.HidKeyboardScanner
 import com.mockschan.cashless.scan.ReaderModeScanner
 import com.mockschan.cashless.scan.ScanDebouncer
@@ -27,9 +28,6 @@ import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import org.json.JSONArray
 import org.json.JSONObject
-import java.math.BigDecimal
-import java.text.NumberFormat
-import java.util.Locale
 import java.util.UUID
 
 class MainActivity : Activity() {
@@ -78,6 +76,7 @@ class MainActivity : Activity() {
     private var requestRunning = false
     private var unusablePending = false
     private var csvForExport: String? = null
+    private var receiveDeviceQr: ((HttpUrl, String) -> Unit)? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -170,6 +169,18 @@ class MainActivity : Activity() {
     @Deprecated("Android Activity result callback")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == DeviceQrScanner.REQUEST_CODE) {
+            val receive = receiveDeviceQr
+            receiveDeviceQr = null
+            if (resultCode != RESULT_OK) return
+            val qr = DeviceQrScanner.read(resultCode, data)
+            when {
+                qr == null -> notifyUser("Dieser QR-Code enthält keine gültige Serveradresse und keinen gültigen Gerätecode.")
+                receive == null -> notifyUser("Bitte die Servereinrichtung öffnen und den QR-Code erneut scannen.")
+                else -> receive(qr.url, qr.deviceKey)
+            }
+            return
+        }
         if (requestCode != SAVE_CSV_REQUEST) return
         val csv = csvForExport
         csvForExport = null
@@ -211,6 +222,7 @@ class MainActivity : Activity() {
 
     private fun installLayout(layout: Int): View {
         screenGeneration++
+        receiveDeviceQr = null
         clearScan()
         clearMessage()
         mainContent.removeAllViews()
@@ -220,7 +232,7 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun showHome() {
+    private fun showHome(verifiedConfig: EventConfig? = null) {
         areaSession = null
         val view = installLayout(R.layout.view_home)
         val cash = view.findViewById<Button>(R.id.btnKasse)
@@ -244,18 +256,23 @@ class MainActivity : Activity() {
             status.text = when {
                 unusablePending -> "Der gespeicherte Buchungsstatus ist unlesbar. Bitte die Administration hinzuziehen."
                 bookings.pending != null -> "Eine Buchung ist offen. Bitte den ursprünglichen Verkaufsbereich öffnen."
+                eventConfig?.areas?.isEmpty() == true -> "Verbunden mit ${eventConfig?.name}. Für dieses Gerät sind keine Bereiche freigegeben."
                 else -> eventConfig?.name.orEmpty()
             }
         }
 
-        eventConfig = null
+        eventConfig = verifiedConfig
         renderConfig()
-        settingsButton.text = "Geräteverbindung einrichten"
+        settingsButton.text = getString(R.string.operation_setup)
         settingsButton.isVisible = bookings.pending == null && !unusablePending
         settingsButton.setOnClickListener { showConnectionSettings() }
+        if (verifiedConfig != null) {
+            settingsButton.isVisible = verifiedConfig.areas.isEmpty() && bookings.pending == null && !unusablePending
+            return
+        }
         val api = api()
         if (api == null) {
-            if (bookings.pending == null && !unusablePending) status.text = "Bitte zuerst die Geräteverbindung einrichten."
+            if (bookings.pending == null && !unusablePending) status.text = "Bitte zuerst den Server einrichten."
             return
         }
 
@@ -264,10 +281,11 @@ class MainActivity : Activity() {
         api.request("bootstrap") { reply ->
             onScreen(screen) {
                 eventConfig = if (reply.successful) decodeEvent(reply.objectBody()) else null
-                if (eventConfig == null) status.text = "Verbindung zur Kasse unterbrochen – bitte kurz prüfen."
-                else {
+                if (eventConfig == null) {
+                    status.text = reply.setupIssue()
+                } else {
                     renderConfig()
-                    settingsButton.isVisible = false
+                    settingsButton.isVisible = eventConfig?.areas.isNullOrEmpty() && bookings.pending == null && !unusablePending
                 }
             }
         }
@@ -313,7 +331,7 @@ class MainActivity : Activity() {
                         "invalid_pin" -> "Die PIN stimmt nicht."
                         "pin_locked" -> "Zu viele Versuche. Bitte kurz warten."
                         "area_unavailable" -> "Dieser Bereich ist gesperrt."
-                        else -> "Verbindung zur Kasse unterbrochen – bitte kurz prüfen."
+                        else -> reply.setupIssue()
                     })
                     return@onScreen
                 }
@@ -330,7 +348,7 @@ class MainActivity : Activity() {
 
     private fun showConnectionSettings(admin: Boolean = false) {
         val page = installLayout(R.layout.view_admin)
-        page.findViewById<TextView>(R.id.adminTitle).text = if (admin) "Administration" else "Geräteverbindung"
+        page.findViewById<TextView>(R.id.adminTitle).text = if (admin) "Administration" else getString(R.string.operation_setup)
         page.findViewById<View>(R.id.wineSwitchRow).isVisible = admin
         page.findViewById<View>(R.id.adminTabs).isVisible = false
         if (admin) renderAdminAreas(page)
@@ -346,27 +364,86 @@ class MainActivity : Activity() {
         code.hint = if (keyStore.read() == null) "Registrierungscode eingeben" else "Zum Ändern neuen Gerätecode eingeben"
         useHid.isChecked = isHidEnabled()
         val savable = bookings.pending == null && !unusablePending
+        val feedback = view.findViewById<TextView>(R.id.serverSetupStatus)
+        val reset = view.findViewById<Button>(R.id.btnResetBaseUrl)
+        val scanQr = view.findViewById<Button>(R.id.btnScanDeviceQr)
+        var qrBase: HttpUrl? = null
+        var qrKey: String? = null
+        scanQr.isEnabled = savable
+        scanQr.setOnClickListener {
+            if (bookings.pending != null || unusablePending) return@setOnClickListener
+            receiveDeviceQr = { url, key ->
+                if (view.parent === container) {
+                    qrBase = url
+                    qrKey = key
+                    address.setText(url.toString())
+                    code.text.clear()
+                    code.hint = "Gerätecode aus QR-Code übernommen"
+                    feedback.isVisible = true
+                    feedback.text = "Bitte die Serveradresse prüfen und die Verbindung bestätigen."
+                }
+            }
+            if (!DeviceQrScanner.start(this)) {
+                receiveDeviceQr = null
+                feedback.isVisible = true
+                feedback.text = "Die Kamera ist hier nicht verfügbar. Serveradresse und Gerätecode können von Hand eingegeben werden."
+            }
+        }
         view.findViewById<Button>(R.id.btnSaveBaseUrl).apply {
             isEnabled = savable
             setOnClickListener {
                 if (bookings.pending != null) return@setOnClickListener
                 val base = validatedBase(address.text.toString())
-                val deviceCode = code.text.toString().trim()
-                val oldBase = settings.getString(BASE_PREF, DEFAULT_BASE)?.toHttpUrlOrNull()
+                val enteredCode = code.text.toString().trim()
+                val scannedCode = qrKey.takeIf { qrBase != null && qrBase == base }.orEmpty()
+                val newCode = enteredCode.ifEmpty { scannedCode }
+                val oldBase = validatedBase(settings.getString(BASE_PREF, DEFAULT_BASE).orEmpty())
+                val existingCode = keyStore.read()
+                val deviceCode = newCode.ifEmpty { existingCode.takeIf { oldBase == base }.orEmpty() }
+                feedback.isVisible = true
                 if (base == null) {
-                    notifyUser("Bitte eine gültige HTTPS-Adresse eingeben.")
-                } else if (deviceCode.isEmpty() && (keyStore.read() == null || oldBase != base)) {
-                    notifyUser("Bitte den Gerätecode für diese Kasse eingeben.")
-                } else if (deviceCode.isNotEmpty() && !deviceCode.matches(Regex("[!-~]{8,256}"))) {
-                    notifyUser("Der Gerätecode hat ein ungültiges Format.")
-                } else {
-                    val editor = settings.edit().putString(BASE_PREF, base.toString()).putBoolean(HID_PREF, useHid.isChecked)
-                    val saved = if (deviceCode.isEmpty()) editor.commit() else keyStore.save(deviceCode, editor)
-                    if (saved) {
-                        startScanner()
-                        showHome()
-                    } else {
-                        notifyUser(if (Build.VERSION.SDK_INT < 23) "Geräteanmeldung benötigt Android 6 oder neuer." else "Die Geräteverbindung konnte nicht sicher gespeichert werden.")
+                    feedback.text = "Bitte eine gültige HTTPS-Serveradresse eingeben."
+                    return@setOnClickListener
+                }
+                if (deviceCode.isEmpty()) {
+                    feedback.text = "Bitte den Gerätecode eingeben, der auf diesem Server für dieses Gerät registriert wurde."
+                    return@setOnClickListener
+                }
+                if (!deviceCode.matches(Regex("[!-~]{8,256}"))) {
+                    feedback.text = "Der Gerätecode hat ein ungültiges Format."
+                    return@setOnClickListener
+                }
+                val useExternalScanner = useHid.isChecked
+                isEnabled = false
+                reset.isEnabled = false
+                scanQr.isEnabled = false
+                address.isEnabled = false
+                code.isEnabled = false
+                useHid.isEnabled = false
+                feedback.text = "Serververbindung wird geprüft …"
+                val screen = screenGeneration
+                OdentalerApi(base, deviceCode).request("bootstrap") { reply ->
+                    onScreen(screen) {
+                        isEnabled = savable
+                        reset.isEnabled = savable
+                        scanQr.isEnabled = savable
+                        address.isEnabled = true
+                        code.isEnabled = true
+                        useHid.isEnabled = true
+                        val config = if (reply.successful) decodeEvent(reply.objectBody()) else null
+                        if (config == null) {
+                            feedback.text = reply.setupIssue()
+                            return@onScreen
+                        }
+                        if (bookings.pending != null || unusablePending) {
+                            feedback.text = "Bitte zuerst die offene Buchung klären."
+                            return@onScreen
+                        }
+                        val editor = settings.edit().putString(BASE_PREF, base.toString())
+                            .putBoolean(HID_PREF, useExternalScanner)
+                        val saved = if (newCode.isEmpty()) editor.commit() else keyStore.save(deviceCode, editor)
+                        if (saved) showHome(config)
+                        else feedback.text = "Die Serververbindung konnte nicht sicher gespeichert werden."
                     }
                 }
             }
@@ -375,12 +452,12 @@ class MainActivity : Activity() {
             isEnabled = savable
             setOnClickListener {
                 trackDialog(AlertDialog.Builder(this@MainActivity)
-                    .setTitle("Geräteverbindung entfernen?")
+                    .setTitle("Serververbindung entfernen?")
                     .setNegativeButton("Abbrechen", null)
                     .setPositiveButton("Entfernen") { _, _ ->
                         if (bookings.pending == null && keyStore.clear(settings.edit().remove(BASE_PREF))) {
                             showHome()
-                        } else notifyUser("Die Geräteverbindung konnte nicht entfernt werden.")
+                        } else notifyUser("Die Serververbindung konnte nicht entfernt werden.")
                     }
                     .create())
             }
@@ -400,7 +477,7 @@ class MainActivity : Activity() {
         page.findViewById<Button>(R.id.tabCounter).apply {
             text = "Kassenübersicht"
             setOnClickListener {
-                AdminReportView(this@MainActivity, api, session.token, ::money, ::notifyUser, ::saveCsv).show(container)
+                AdminReportView(this@MainActivity, api, session.token, ::formatTokens, ::notifyUser, ::saveCsv).show(container)
             }
         }
     }
@@ -601,7 +678,7 @@ class MainActivity : Activity() {
             }
             mainContent.findViewById<TextView>(R.id.uidInfo)?.apply {
                 isVisible = scanReady
-                text = activeScan?.let { "Guthaben  ${money(it.balanceCents)}" }.orEmpty()
+                text = activeScan?.let { "Guthaben  ${formatTokens(it.balanceCents)}" }.orEmpty()
             }
             mainContent.findViewById<Button>(R.id.btnLoadTokens)?.isEnabled = ready
             mainContent.findViewById<Button>(R.id.btnRefund)?.isEnabled = ready && (activeScan?.balanceCents ?: 0) > 0
@@ -622,7 +699,7 @@ class MainActivity : Activity() {
                     }
                     val row = layoutInflater.inflate(R.layout.item_product_row, this, false)
                     row.findViewById<TextView>(R.id.txtProductName).text = product.name
-                    row.findViewById<TextView>(R.id.txtProductPrice).text = money(product.priceCents)
+                    row.findViewById<TextView>(R.id.txtProductPrice).text = formatTokens(product.priceCents)
                     val quantity = row.findViewById<TextView>(R.id.txtQty)
                     val minus = row.findViewById<Button>(R.id.btnMinus)
                     val plus = row.findViewById<Button>(R.id.btnPlus)
@@ -656,7 +733,7 @@ class MainActivity : Activity() {
         val activeScan = scan
         val total = cartTotal()
         mainContent.findViewById<TextView>(R.id.tokenDisplay)?.text = if (activeScan == null || scanLoading) prompt
-            else "Guthaben  ${money(activeScan.balanceCents)}\nWarenkorb  ${money(total)}"
+            else "Guthaben  ${formatTokens(activeScan.balanceCents)}\nWarenkorb  ${formatTokens(total)}"
         mainContent.findViewById<TextView>(R.id.tokenWarning)?.apply {
             isVisible = activeScan != null && total > activeScan.balanceCents
             text = "Guthaben reicht nicht aus."
@@ -674,24 +751,28 @@ class MainActivity : Activity() {
         val band = validScan() ?: return
         val fullRefund = band.balanceCents.takeIf { it > 0 }
         val amount = EditText(this).apply {
-            hint = "z. B. 12,50"
-            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+            hint = "z. B. 12,5 Token"
+            keyListener = DigitsKeyListener.getInstance("0123456789,.")
+            setRawInputType(InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL)
             setSingleLine()
         }
         val form = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             val padding = (24 * resources.displayMetrics.density).toInt()
             setPadding(padding, 0, padding, 0)
-            addView(TextView(this@MainActivity).apply { text = "Guthaben  ${money(band.balanceCents)}" })
-            val amounts = if (refund) listOfNotNull(fullRefund) else eventConfig?.presetCents.orEmpty()
+            addView(TextView(this@MainActivity).apply { text = "Guthaben  ${formatTokens(band.balanceCents)}" })
+            val amounts = if (refund) listOfNotNull(fullRefund)
+                else eventConfig?.presetCents.orEmpty().filter(::isHalfTokenAmount)
             amounts.take(8).chunked(2).forEach { pair ->
                 addView(LinearLayout(this@MainActivity).apply {
                     pair.forEach { cents ->
                         addView(Button(this@MainActivity).apply {
-                            text = if (refund) "Gesamt ${money(cents)}" else money(cents)
-                            setOnClickListener {
-                                amount.setText(BigDecimal.valueOf(cents, 2).toPlainString().replace('.', ','))
+                            text = when {
+                                refund && !isHalfTokenAmount(cents) -> "Restguthaben ${formatTokens(cents)}"
+                                refund -> "Gesamt ${formatTokens(cents)}"
+                                else -> formatTokens(cents)
                             }
+                            setOnClickListener { amount.setText(tokenInputText(cents)) }
                         }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
                     }
                 })
@@ -700,22 +781,23 @@ class MainActivity : Activity() {
         }
 
         val picker = AlertDialog.Builder(this)
-            .setTitle(if (refund) "Auszahlungsbetrag" else "Aufladebetrag")
+            .setTitle(if (refund) "Wie viele Token auszahlen?" else "Wie viele Token aufladen?")
             .setView(form)
             .setNegativeButton("Abbrechen", null)
             .setPositiveButton("Weiter", null)
             .create()
         trackDialog(picker)
         picker.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
-            val cents = parsePositiveCents(amount.text.toString())
-            if (cents == null || (refund && cents > band.balanceCents)) {
-                amount.error = "Bitte einen gültigen Betrag eingeben."
+            val cents = parseTokenEntry(amount.text.toString(), refundBalance = fullRefund.takeIf { refund })
+            if (cents == null) {
+                amount.error = if (refund) "Halbe oder ganze Token bis zum Guthaben wählen. Das volle Restguthaben ist ebenfalls möglich."
+                    else "Bitte halbe oder ganze Token eingeben."
             } else {
                 picker.dismiss()
                 val kind = if (refund) "refund" else "topup"
                 confirmBooking(
                     band,
-                    if (refund) "${money(cents)} bar auszahlen?" else "Barzahlung über ${money(cents)} erhalten?",
+                    if (refund) "${formatTokens(cents)} auszahlen?" else "${formatTokens(cents)} aufladen?",
                     if (refund) "Nach der Bestätigung das Bargeld ausgeben." else "Bitte erst buchen, wenn das Bargeld entgegengenommen wurde.",
                     JSONObject().put("kind", kind).put("scan_id", band.id)
                         .put("amount_cents", cents).put("payment_method", "cash")
@@ -739,7 +821,7 @@ class MainActivity : Activity() {
                 .put("unit_price_cents", product.priceCents))
         }
         confirmBooking(
-            band, "${money(total)} abbuchen?", note,
+            band, "${formatTokens(total)} abbuchen?", note,
             JSONObject().put("kind", "sale").put("scan_id", band.id).put("items", items),
             note
         )
@@ -846,16 +928,17 @@ class MainActivity : Activity() {
         if (area == CASH) showCash() else showCounter(area)
         if (confirmed) {
             val confirmation = when (kind) {
-                "topup" -> "Aufgeladen  ${money(booked)}"
-                "refund" -> "Auszahlung verbucht  ${money(booked)}"
-                else -> "Bezahlt  ${money(booked)}"
+                "topup" -> "Aufgeladen  ${formatTokens(booked)}"
+                "refund" -> "Auszahlung verbucht  ${formatTokens(booked)}"
+                else -> "Bezahlt  ${formatTokens(booked)}"
             }
             val detail = if (note.isBlank()) "" else "\n$note"
-            showMessage("$confirmation\nNeues Guthaben  ${money(balance)}$detail", success = true)
+            showMessage("$confirmation\nNeues Guthaben  ${formatTokens(balance)}$detail", success = true)
         } else {
             showMessage(when (reply.error) {
                 "insufficient_balance" -> "Guthaben reicht nicht aus. Bitte erneut scannen."
                 "balance_limit" -> "Der Betrag überschreitet das erlaubte Guthaben."
+                "invalid_token_step" -> "Bitte halbe oder ganze Token wählen und erneut scannen."
                 "price_changed" -> "Ein Preis wurde geändert. Bitte Bestellung neu erfassen."
                 "product_unavailable" -> "Ein Produkt ist nicht mehr verfügbar. Bitte Bestellung neu erfassen."
                 "scan_expired", "scan_closed", "scan_not_found" -> "Die Scanzeit ist abgelaufen. Bitte erneut scannen."
@@ -980,8 +1063,12 @@ class MainActivity : Activity() {
         return OdentalerApi(url, key)
     }
 
-    private fun validatedBase(value: String): HttpUrl? = value.trim().toHttpUrlOrNull()?.takeIf {
-        it.isHttps && it.username.isEmpty() && it.password.isEmpty() && it.query == null && it.fragment == null
+    private fun validatedBase(value: String): HttpUrl? {
+        val input = value.trim()
+        val address = if ("://" in input) input else "https://$input"
+        return address.toHttpUrlOrNull()?.takeIf {
+            it.isHttps && it.username.isEmpty() && it.password.isEmpty() && it.query == null && it.fragment == null
+        }
     }
 
     private fun notifyUser(text: String) = Toast.makeText(this, text, Toast.LENGTH_LONG).show()
@@ -1033,9 +1120,6 @@ class MainActivity : Activity() {
     private fun validUuid(value: String): Boolean = runCatching {
         UUID.fromString(value).toString() == value
     }.getOrDefault(false)
-
-    private fun money(cents: Long): String =
-        NumberFormat.getCurrencyInstance(Locale.GERMANY).format(BigDecimal.valueOf(cents, 2))
 
     private companion object {
         const val CASH = "cash"

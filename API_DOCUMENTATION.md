@@ -2,6 +2,8 @@
 
 Die API arbeitet per JSON und HTTPS. Der Buchungsdienst verwendet untenstehende `/v1`-Routen. Die Schnittstellen des gelieferten Archivs sind in [PROJECT_AUDIT.md](PROJECT_AUDIT.md) dokumentiert. Bestandsclients müssen den versionierten Vertrag verwenden.
 
+Guthaben und Preise werden in Token angezeigt. Aus Kompatibilitätsgründen behalten bestehende Datenbankspalten und JSON-Felder ihre Namen mit `_cents`. Ein Token entspricht 100 gespeicherten Einheiten, ein halber Token 50. Neue Aufladungen und Teilrückzahlungen erfolgen in halben Schritten. Ein historischer Restbetrag kann vollständig und exakt ausgezahlt werden.
+
 ## Anmeldung und Gerätekontext
 
 - `GET /healthz` liefert HTTP 200 mit `{"status":"ok"}`, wenn Datenbank und Buchungsschema erreichbar sind.
@@ -30,8 +32,8 @@ Bei unklarer Antwort zuerst den Status abfragen. `transaction_not_found` kann au
 - `GET /v1/admin/areas` liefert die veranstaltungsbezogenen Schalter.
 - `PUT /v1/admin/areas/{wine|mobile}` setzt `{"enabled":true}` oder `{"enabled":false}`. Ein Gerät braucht zusätzlich die passende Bereichszuteilung.
 - `GET /v1/admin/report` liefert Bargeldaufladungen, Barauszahlungen, Produktumsatz und aktuelles Restguthaben sowie Verkäufe je Bereich, Produkt und Gerät.
-- `GET /v1/admin/transactions.csv` liefert einen Semikolon-getrennten Export mit einer Zeile pro Buchung, Zeit in UTC, Buchungsart und Beträgen in Cent.
+- `GET /v1/admin/transactions.csv` liefert einen Semikolon-getrennten Export mit einer Zeile pro Buchung, Zeit in UTC, Buchungsart und Beträgen in Token.
 - Die Berichtsrouten benötigen `from` und `until` als RFC-3339-Datum mit Zeitzone und Sekunden. Der Zeitraum ist unten inklusive, oben exklusiv und höchstens 31 Tage groß. CSV fasst maximal 10.000 Zeilen. Bei Überschreitung muss der Zeitraum verkürzt werden.
-- Geräteprovisionierung, PIN-Wechsel und die erste Anlage von Veranstaltungen und Produkten erfolgen über die [Verwaltungskommandos](DEPLOYMENT.md).
+- Geräteprovisionierung, PIN-Wechsel und Veranstaltungspflege sind im [Browser-Admin](DEPLOYMENT.md) verfügbar. Der Registrierungs-QR enthält JSON mit `type: "odentaler-device"`, `version: 1`, `url` und `device_key`.
 
 Fehler liefern, soweit sie durch eine Fachroute beantwortet werden, `{"error":"<code>"}`. Wichtige Beispiele sind `session_unauthorized`, `area_unavailable`, `pin_locked`, `scan_expired`, `insufficient_balance`, `price_changed` und `database_unavailable`. Ein Netzwerkfehler oder HTTP 5xx bestätigt keine Buchung.

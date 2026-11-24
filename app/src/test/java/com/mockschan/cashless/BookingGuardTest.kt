@@ -54,17 +54,7 @@ class BookingGuardTest {
         assertEquals(BookingAction.UNRESOLVED, bookingAction(404, "transaction_not_found", confirmed = false))
         assertEquals(BookingAction.CONFIRMED, bookingAction(200, null, confirmed = true, lookup = true))
         assertEquals(BookingAction.REJECTED, bookingAction(409, "insufficient_balance", confirmed = false, lookup = true))
-    }
-
-    @Test fun amountsAreParsedWithoutRounding() {
-        assertEquals(1050L, parsePositiveCents("10,50"))
-        assertEquals(50L, parsePositiveCents("0.5"))
-        assertEquals(1L, parsePositiveCents("0,01"))
-        assertNull(parsePositiveCents("0.001"))
-        assertNull(parsePositiveCents("1e3"))
-        assertNull(parsePositiveCents("-3"))
-        assertNull(parsePositiveCents("0"))
-        assertNull(parsePositiveCents("1000000000000"))
+        assertEquals(BookingAction.REJECTED, bookingAction(400, "invalid_token_step", confirmed = false))
     }
 
     private class MemoryStore : BookingStore {

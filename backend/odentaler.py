@@ -12,9 +12,10 @@ from psycopg.rows import dict_row
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from ledger import (
-    SALE_AREAS, book, booking_status, close_scan, error, open_scan, uuid_value,
+    HALF_TOKEN_UNITS, SALE_AREAS, book, booking_status, close_scan, error, open_scan, uuid_value,
 )
 from reporting import register_reporting
+from web_admin import register_web_admin
 
 
 AREAS = ("cash", *SALE_AREAS, "admin")
@@ -119,6 +120,8 @@ def create_app(config=None):
     app.config.from_mapping(
         DATABASE_URL=os.environ.get("DATABASE_URL"),
         TEST_PINS=os.environ.get("ODENTALER_ENV") == "test",
+        WEB_ADMIN_PASSWORD=os.environ.get("ODENTALER_WEB_ADMIN_PASSWORD"),
+        WEB_ADMIN_ORIGIN=os.environ.get("ODENTALER_WEB_ADMIN_ORIGIN"),
         MAX_CONTENT_LENGTH=65_536,
     )
     app.config.update(config or {})
@@ -273,6 +276,7 @@ def create_app(config=None):
         return {"area": area, "enabled": body["enabled"]}
 
     register_reporting(app, with_session)
+    register_web_admin(app)
     register_cli(app)
     return app
 
@@ -400,6 +404,8 @@ def register_cli(app):
     @click.option("--price-cents", required=True, type=click.IntRange(1, 100_000_000))
     @click.option("--area", required=True, multiple=True, type=click.Choice(SALE_AREAS))
     def add_product(event_id, name, category, price_cents, area):
+        if price_cents % HALF_TOKEN_UNITS:
+            raise click.ClickException("Der Preis muss einem halben oder ganzen Token entsprechen.")
         with connect(app.config["DATABASE_URL"]) as db:
             if not db.execute("SELECT 1 FROM events WHERE id = %s", (event_id,)).fetchone():
                 raise click.ClickException("Veranstaltung wurde nicht gefunden.")
@@ -420,6 +426,8 @@ def register_cli(app):
     @click.option("--sort-order", type=click.IntRange(-2_147_483_648, 2_147_483_647))
     @click.option("--active/--inactive", default=None)
     def edit_product(event_id, product_id, name, category, price_cents, area, sort_order, active):
+        if price_cents is not None and price_cents % HALF_TOKEN_UNITS:
+            raise click.ClickException("Der neue Preis muss einem halben oder ganzen Token entsprechen.")
         if name is not None and not name.strip():
             raise click.ClickException("Produktname darf nicht leer sein.")
         with connect(app.config["DATABASE_URL"]) as db:
@@ -445,6 +453,8 @@ def register_cli(app):
         if name is not None and not name.strip():
             raise click.ClickException("Veranstaltungsname darf nicht leer sein.")
         presets = list(dict.fromkeys(topup_cents))
+        if any(value % HALF_TOKEN_UNITS for value in presets):
+            raise click.ClickException("Aufladebeträge müssen in halben Token angegeben werden.")
         if len(presets) > 8:
             raise click.ClickException("Maximal acht feste Aufladebeträge angeben.")
         with connect(app.config["DATABASE_URL"]) as db:

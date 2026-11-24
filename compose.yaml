@@ -17,6 +17,8 @@ services:
     environment:
       DATABASE_URL: "postgresql://odentaler:${ODENTALER_DB_PASSWORD:?Datenbankpasswort in .env setzen}@db:5432/odentaler"
       ODENTALER_ENV: "${ODENTALER_ENV:-production}"
+      ODENTALER_WEB_ADMIN_PASSWORD: "${ODENTALER_WEB_ADMIN_PASSWORD:-}"
+      ODENTALER_WEB_ADMIN_ORIGIN: "${ODENTALER_WEB_ADMIN_ORIGIN:-}"
     depends_on:
       db:
         condition: service_healthy

@@ -9,6 +9,7 @@ from psycopg.types.json import Jsonb
 
 SALE_AREAS = ("drinks", "food", "wine", "mobile")
 MAX_BOOKING_CENTS = 100_000_000
+HALF_TOKEN_UNITS = 50
 MAX_BALANCE_CENTS = 1_000_000_000_000
 UID_PATTERN = re.compile(r"(?:[0-9A-F]{2}){4,16}", re.ASCII | re.IGNORECASE)
 
@@ -172,6 +173,8 @@ def apply_booking(db, actor, key, payload):
         return error(400, "invalid_request")
     uid = scan["uid"]
     if kind == "topup":
+        if amount % HALF_TOKEN_UNITS:
+            return error(400, "invalid_token_step")
         db.execute(
             "INSERT INTO accounts (event_id, uid) VALUES (%s, %s) ON CONFLICT DO NOTHING",
             (event_id, uid),
@@ -186,6 +189,9 @@ def apply_booking(db, actor, key, payload):
     after = before + amount if kind == "topup" else before - amount
     if after < 0:
         return error(409, "insufficient_balance")
+    # A complete refund can return a historical balance outside the half-token grid.
+    if kind == "refund" and amount % HALF_TOKEN_UNITS and after != 0:
+        return error(400, "invalid_token_step")
     if after > MAX_BALANCE_CENTS:
         return error(409, "balance_limit")
 

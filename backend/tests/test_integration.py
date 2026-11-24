@@ -156,14 +156,28 @@ class PostgresIntegrationTest(unittest.TestCase):
         card = {**self.cash_order(account, 500), "payment_method": "card"}
         self.assert_error(409, "unsupported_payment_method", self.post_booking(self.cash, card))
         self.assertEqual(500, self.fund(500)["balance_after_cents"])
-        response = self.post_booking(self.cash, self.cash_order(self.scan(self.cash), 175, "refund"))
+        response = self.post_booking(self.cash, self.cash_order(self.scan(self.cash), 150, "refund"))
         self.assertEqual(200, response.status_code)
         receipt = response.get_json()
-        self.assertEqual((500, 325), (receipt["balance_before_cents"], receipt["balance_after_cents"]))
+        self.assertEqual((500, 350), (receipt["balance_before_cents"], receipt["balance_after_cents"]))
         self.assert_error(
             409, "insufficient_balance",
-            self.post_booking(self.cash, self.cash_order(self.scan(self.cash), 326, "refund")),
+            self.post_booking(self.cash, self.cash_order(self.scan(self.cash), 400, "refund")),
         )
+
+    def test_half_token_step_and_exact_legacy_full_refund(self):
+        account = self.scan(self.cash)
+        self.assert_error(400, "invalid_token_step",
+                          self.post_booking(self.cash, self.cash_order(account, 25)))
+        self.assertEqual(50, self.fund(50)["balance_after_cents"])
+        with connect(self.dsn) as db:
+            db.execute("UPDATE accounts SET balance_cents = 125 WHERE event_id = %s AND uid = %s", (self.event, UID))
+        scan = self.scan(self.cash)
+        self.assert_error(400, "invalid_token_step",
+                          self.post_booking(self.cash, self.cash_order(scan, 25, "refund")))
+        receipt = self.post_booking(self.cash, self.cash_order(scan, 125, "refund"))
+        self.assertEqual(200, receipt.status_code)
+        self.assertEqual(0, receipt.get_json()["balance_after_cents"])
 
     def test_sale_multiple_products_and_price_snapshot(self):
         self.fund(1500)
@@ -369,7 +383,7 @@ class PostgresIntegrationTest(unittest.TestCase):
             db.execute("UPDATE accounts SET balance_cents = %s WHERE event_id = %s AND uid = %s",
                        (MAX_BALANCE_CENTS, self.event, UID))
         scan = self.scan(self.cash)
-        self.assert_error(409, "balance_limit", self.post_booking(self.cash, self.cash_order(scan, 1)))
+        self.assert_error(409, "balance_limit", self.post_booking(self.cash, self.cash_order(scan, 50)))
         self.assert_error(400, "invalid_request", self.post_booking(self.cash, self.cash_order(scan, 0.5)))
         second_scope = self.session("drinks", self.second_key)
         order = self.sale_order(self.scan(self.drinks), (self.beer, 1, 250))

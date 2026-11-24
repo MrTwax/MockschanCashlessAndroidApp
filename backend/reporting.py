@@ -1,5 +1,6 @@
 import csv
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from io import StringIO
 import re
 
@@ -89,13 +90,14 @@ def register_reporting(app, with_session):
         writer = csv.writer(output, delimiter=";")
         writer.writerow((
             "Transaktion", "Zeitpunkt (UTC)", "Vorgang", "Zahlungsart", "Bereich", "Gerät",
-            "Betrag (Cent)", "Guthaben vorher (Cent)", "Guthaben nachher (Cent)",
+            "Betrag (Token)", "Guthaben vorher (Token)", "Guthaben nachher (Token)",
         ))
         for row in rows:
             writer.writerow((
                 row["id"], row["created_at"].astimezone(timezone.utc).isoformat(),
                 row["kind"], row["payment_method"], row["area"], row["device_id"],
-                row["amount_cents"], row["balance_before_cents"], row["balance_after_cents"],
+                *(format(Decimal(row[field]).scaleb(-2), "f").replace(".", ",")
+                  for field in ("amount_cents", "balance_before_cents", "balance_after_cents")),
             ))
         return Response(
             output.getvalue(), mimetype="text/csv",

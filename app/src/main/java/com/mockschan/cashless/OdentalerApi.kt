@@ -11,12 +11,44 @@ import okhttp3.Response
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
+import java.net.SocketTimeoutException
+import java.net.UnknownHostException
+import javax.net.ssl.SSLException
 
-internal data class ApiReply(val status: Int, val body: String?) {
+internal enum class ConnectionFailure { DNS, TLS, TIMEOUT, NETWORK }
+
+internal data class ApiReply(
+    val status: Int,
+    val body: String?,
+    val connectionFailure: ConnectionFailure? = null
+) {
     fun objectBody(): JSONObject? = runCatching { JSONObject(body ?: return null) }.getOrNull()
     fun arrayBody(): JSONArray? = runCatching { JSONArray(body ?: return null) }.getOrNull()
     val successful: Boolean get() = status in 200..299
     val error: String? get() = objectBody()?.optString("error")?.takeIf(String::isNotEmpty)
+
+    fun setupIssue(): String = when (connectionFailure) {
+        ConnectionFailure.DNS -> "Die Serveradresse wurde nicht gefunden. Prüfe die Adresse und das WLAN."
+        ConnectionFailure.TLS -> "Das HTTPS-Zertifikat des Servers konnte nicht geprüft werden. Prüfe Servername und Zertifikat."
+        ConnectionFailure.TIMEOUT -> "Der Server antwortet zu langsam. Prüfe das WLAN und ob der Server läuft."
+        ConnectionFailure.NETWORK -> "Der Server ist nicht erreichbar. Prüfe das WLAN und ob der Server läuft."
+        null -> when (status) {
+            401, 403 -> "Der Server hat den Gerätecode abgelehnt. Verwende einen für dieses Gerät registrierten Code."
+            404, 405 -> "Unter dieser Adresse fehlt die Odentaler-Schnittstelle /v1. Prüfe die Serveradresse und die Backend-Version."
+            in 300..399 -> "Die Serveradresse leitet weiter. Gib die endgültige HTTPS-Adresse ein."
+            in 500..599 -> "Der Server antwortet, kann die Veranstaltung aber gerade nicht laden. Bitte prüfe das Backend."
+            else -> "Die Serverantwort passt nicht zur App. Prüfe die Backend-Version."
+        }
+    }
+
+    companion object {
+        fun networkError(error: IOException): ApiReply = ApiReply(0, null, when (error) {
+            is UnknownHostException -> ConnectionFailure.DNS
+            is SSLException -> ConnectionFailure.TLS
+            is SocketTimeoutException -> ConnectionFailure.TIMEOUT
+            else -> ConnectionFailure.NETWORK
+        })
+    }
 }
 
 internal class OdentalerApi(private val base: HttpUrl, private val deviceKey: String) {
@@ -40,14 +72,14 @@ internal class OdentalerApi(private val base: HttpUrl, private val deviceKey: St
         }.build()
 
         client.newCall(request).enqueue(object : Callback {
-            override fun onFailure(call: Call, e: IOException) = complete(ApiReply(0, null))
+            override fun onFailure(call: Call, e: IOException) = complete(ApiReply.networkError(e))
 
             override fun onResponse(call: Call, response: Response) {
                 val reply = response.use {
                     try {
                         ApiReply(it.code, it.body?.string())
-                    } catch (_: IOException) {
-                        ApiReply(0, null)
+                    } catch (error: IOException) {
+                        ApiReply.networkError(error)
                     }
                 }
                 complete(reply)

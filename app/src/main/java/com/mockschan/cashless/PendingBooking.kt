@@ -1,6 +1,5 @@
 package com.mockschan.cashless
 
-import java.math.BigDecimal
 import java.util.UUID
 
 internal data class PendingBooking(
@@ -46,13 +45,5 @@ internal fun bookingAction(status: Int, error: String?, confirmed: Boolean, look
 private val finalBookingErrors = setOf(
     "invalid_request", "invalid_uid", "invalid_idempotency_key", "account_not_found",
     "scan_not_found", "scan_expired", "scan_closed", "insufficient_balance", "product_unavailable",
-    "price_changed", "unsupported_payment_method", "balance_limit"
+    "price_changed", "unsupported_payment_method", "balance_limit", "invalid_token_step"
 )
-
-internal fun parsePositiveCents(input: String): Long? {
-    val decimal = input.trim().replace(',', '.')
-    if (!decimal.matches(Regex("[0-9]{1,12}(\\.[0-9]{1,2})?"))) return null
-    return runCatching {
-        BigDecimal(decimal).movePointRight(2).longValueExact().takeIf { it > 0 }
-    }.getOrNull()
-}

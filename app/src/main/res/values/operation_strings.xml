@@ -5,7 +5,7 @@
     <string name="operation_food">Essenstheke</string>
     <string name="operation_wine">Weintheke</string>
     <string name="operation_mobile">Mobile Bedienung</string>
-    <string name="operation_admin">Einstellungen</string>
+    <string name="operation_admin">Einstellungen / Administration</string>
     <string name="operation_back">Zurück</string>
     <string name="operation_cancel">Abbrechen</string>
     <string name="operation_pay">Bezahlen</string>
@@ -14,9 +14,12 @@
     <string name="operation_scan">Armband an den Leser halten.</string>
     <string name="operation_balance">Guthaben</string>
     <string name="operation_select_counter">Theke auswählen</string>
-    <string name="operation_setup">Gerät einrichten</string>
+    <string name="operation_setup">Server einrichten</string>
     <string name="operation_device_code">Gerätecode</string>
     <string name="operation_device_code_hint">Code für dieses Gerät</string>
+    <string name="operation_scan_device_qr">QR-Code scannen</string>
+    <string name="operation_qr_prompt">QR-Code aus der Geräteverwaltung in den Rahmen halten.</string>
+    <string name="operation_qr_camera_permission">Erlaube den Kamerazugriff in den Android-App-Einstellungen oder gib den Gerätecode manuell ein.</string>
     <string name="operation_external_scanner">Externer NFC-Leser im Tastaturmodus</string>
     <string name="operation_quantity_decrease">Menge verringern</string>
     <string name="operation_quantity_increase">Menge erhöhen</string>
