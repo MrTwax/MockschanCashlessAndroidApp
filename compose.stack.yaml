@@ -1,0 +1,68 @@
+services:
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: odentaler
+      POSTGRES_USER: odentaler
+      POSTGRES_PASSWORD: "${ODENTALER_DB_PASSWORD:?Datenbankpasswort in .env setzen}"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "odentaler", "-d", "odentaler"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+  migrate:
+    image: "${ODENTALER_IMAGE:?Vollständigen Image-Namen mit Versions-Tag setzen}"
+    command: ["flask", "--app", "odentaler", "migrate"]
+    environment:
+      DATABASE_URL: "postgresql://odentaler:${ODENTALER_DB_PASSWORD:?Datenbankpasswort setzen}@db:5432/odentaler"
+    depends_on:
+      db:
+        condition: service_healthy
+  api:
+    image: "${ODENTALER_IMAGE:?Vollständigen Image-Namen mit Versions-Tag setzen}"
+    environment:
+      DATABASE_URL: "postgresql://odentaler:${ODENTALER_DB_PASSWORD:?Datenbankpasswort in .env setzen}@db:5432/odentaler"
+      ODENTALER_ENV: "${ODENTALER_ENV:-production}"
+      ODENTALER_WEB_ADMIN_PASSWORD: "${ODENTALER_WEB_ADMIN_PASSWORD:-}"
+      ODENTALER_WEB_ADMIN_ORIGIN: "${ODENTALER_WEB_ADMIN_ORIGIN:-}"
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz', timeout=3).close()"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+  tls:
+    image: caddy:2-alpine
+    ports:
+      - "${ODENTALER_BIND_ADDRESS:-127.0.0.1}:${ODENTALER_TLS_PORT:-443}:443"
+    configs:
+      - source: caddyfile
+        target: /etc/caddy/Caddyfile
+    volumes:
+      - tls_data:/data
+      - tls_config:/config
+    depends_on:
+      api:
+        condition: service_healthy
+configs:
+  caddyfile:
+    content: |
+      {
+        admin off
+        auto_https disable_redirects
+      }
+      https://${ODENTALER_HOST:-cashless.local} {
+        tls internal
+        reverse_proxy api:8000
+      }
+volumes:
+  postgres_data:
+  tls_data:
+  tls_config:
+

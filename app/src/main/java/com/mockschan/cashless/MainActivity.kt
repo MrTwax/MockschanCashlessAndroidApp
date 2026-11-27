@@ -204,6 +204,10 @@ class MainActivity : Activity() {
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
         if (!hasFocus && ::hid.isInitialized) hid.reset()
+        if (hasFocus && active && ::nfc.isInitialized && !isHidEnabled()) {
+            if (nfc.isEnabled) nfc.start() else nfc.stop()
+            renderSalesState()
+        }
     }
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
@@ -669,7 +673,8 @@ class MainActivity : Activity() {
             scanLoading -> "Armband wird geprüft …"
             !isHidEnabled() && !nfc.isAvailable -> "Dieses Gerät hat keinen NFC-Leser."
             !isHidEnabled() && !nfc.isEnabled -> "Bitte NFC in Android aktivieren."
-            else -> "Bitte Armband scannen."
+            isHidEnabled() -> "Armband mit dem externen Scanner lesen."
+            else -> "Armband an den NFC-Leser des Geräts halten."
         }
         if (session.area == CASH) {
             mainContent.findViewById<TextView>(R.id.kasseScanHint)?.apply {

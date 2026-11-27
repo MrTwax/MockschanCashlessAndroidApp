@@ -34,12 +34,14 @@ internal class ReaderModeScanner(
         reader.enableReaderMode(
             activity,
             { tag ->
-                val uid = tag.id?.toBandUid() ?: return@enableReaderMode
+                val uid = tag.id?.toBandUid(allowOtherLengths = true) ?: return@enableReaderMode
                 activity.runOnUiThread {
                     if (active && readerGeneration == generation) onScan(uid)
                 }
             },
-            NfcAdapter.FLAG_READER_NFC_A or NfcAdapter.FLAG_READER_SKIP_NDEF_CHECK,
+            NfcAdapter.FLAG_READER_NFC_A or NfcAdapter.FLAG_READER_NFC_B or
+                NfcAdapter.FLAG_READER_NFC_F or NfcAdapter.FLAG_READER_NFC_V or
+                NfcAdapter.FLAG_READER_SKIP_NDEF_CHECK,
             null
         )
     }

@@ -11,8 +11,10 @@ internal fun normalizeBandUid(value: String): String? {
 private fun isHexDigit(character: Char): Boolean =
     character in '0'..'9' || character in 'A'..'F' || character in 'a'..'f'
 
-internal fun ByteArray.toBandUid(): String? {
-    if (size * 2 !in UID_LENGTHS) return null
+internal fun ByteArray.toBandUid(allowOtherLengths: Boolean = false): String? {
+    if (allowOtherLengths) {
+        if (size !in 4..16) return null
+    } else if (size * 2 !in UID_LENGTHS) return null
     return buildString(size * 2) {
         for (byte in this@toBandUid) {
             val unsigned = byte.toInt() and 0xff
